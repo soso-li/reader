@@ -1,0 +1,16 @@
+{
+  "private": true,
+  "workspaces": [
+    "apps/web"
+  ],
+  "scripts": {
+    "web:dev": "npm --workspace apps/web run dev",
+    "web:build": "npm --workspace apps/web run build",
+    "web:test": "npm --workspace apps/web run test",
+    "web:typecheck": "npm --workspace apps/web run typecheck",
+    "api:test": "cd apps/api && pytest"
+  },
+  "overrides": {
+    "postcss": "8.5.16"
+  }
+}

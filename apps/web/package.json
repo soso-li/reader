@@ -1,0 +1,27 @@
+{
+  "name": "@reader/web",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --hostname 0.0.0.0",
+    "build": "next build",
+    "benchmark:reading-render": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types --import ./app/test-tsx-loader.mjs app/reading-render.benchmark.mjs",
+    "start": "next start --hostname 0.0.0.0",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --experimental-strip-types --import ./app/test-tsx-loader.mjs --test app/event-user-state.test.ts app/*.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "jsdom": "^29.1.1",
+    "lucide-react": "1.22.0",
+    "next": "16.3.0-canary.70",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "sharp": "0.34.5"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^28.0.3",
+    "@types/node": "26.0.1",
+    "@types/react": "19.2.17",
+    "@types/react-dom": "19.2.3",
+    "typescript": "6.0.3"
+  }
+}

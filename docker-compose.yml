@@ -1,0 +1,161 @@
+x-reader-build-args: &reader-build-args
+  READER_VERSION: ${READER_VERSION:-}
+  READER_COMMIT: ${READER_COMMIT:-}
+  READER_BUILD_TIME: ${READER_BUILD_TIME:-}
+  READER_DEPLOY_URL: ${READER_DEPLOY_URL:-http://127.0.0.1:3007}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: reader
+      POSTGRES_USER: reader
+      POSTGRES_PASSWORD: reader
+    ports:
+      - "55438:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reader -d reader"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6387:6379"
+
+  schema-gate:
+    build:
+      context: ./apps/api
+      args: *reader-build-args
+    command: ["python", "-m", "reader_api.migrations", "check-head"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://reader:reader@postgres:5432/reader
+      READER_MIGRATION_DATABASE_URL: postgresql+psycopg://reader:reader@postgres:5432/reader
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ./apps/api
+      args: *reader-build-args
+    environment:
+      DATABASE_URL: postgresql+psycopg://reader:reader@postgres:5432/reader
+      REDIS_URL: redis://redis:6379/0
+      RSSHUB_BASE_URL: ${RSSHUB_BASE_URL:-}
+      READER_VERSION: ${READER_VERSION:-}
+      READER_COMMIT: ${READER_COMMIT:-}
+      READER_BUILD_TIME: ${READER_BUILD_TIME:-}
+      READER_DEPLOY_URL: ${READER_DEPLOY_URL:-http://127.0.0.1:3007}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://127.0.0.1:1234}
+      LLM_MODEL: ${LLM_MODEL:-qwen/qwen3.5-9b}
+      TRANSLATION_MODEL: ${TRANSLATION_MODEL:-hy-mt2-1.8b}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://127.0.0.1:1234}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-qwen3-embedding-4b}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-240}
+      RSS_FETCH_INTERVAL_SECONDS: ${RSS_FETCH_INTERVAL_SECONDS:-1200}
+      LLM_TASK_PROVIDER: ${LLM_TASK_PROVIDER:-local}
+      READER_ARTICLE_IMAGE_CACHE_DIR: /var/lib/reader/article-images
+      READER_ARTICLE_IMAGE_CACHE_MAX_BYTES: ${READER_ARTICLE_IMAGE_CACHE_MAX_BYTES:-53687091200}
+      READER_API_TOKEN: ${READER_API_TOKEN:?Set READER_API_TOKEN}
+    volumes:
+      - article-image-cache:/var/lib/reader/article-images
+    depends_on:
+      postgres:
+        condition: service_healthy
+      schema-gate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8007:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  worker-fetch:
+    build:
+      context: ./apps/api
+      args: *reader-build-args
+    command: ["python", "-m", "reader_api.worker"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://reader:reader@postgres:5432/reader
+      REDIS_URL: redis://redis:6379/0
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://127.0.0.1:1234}
+      LLM_MODEL: ${LLM_MODEL:-qwen/qwen3.5-9b}
+      TRANSLATION_MODEL: ${TRANSLATION_MODEL:-hy-mt2-1.8b}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://127.0.0.1:1234}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-qwen3-embedding-4b}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-240}
+      RSS_FETCH_INTERVAL_SECONDS: ${RSS_FETCH_INTERVAL_SECONDS:-1200}
+      READER_WORKER_ROLE: fetch
+      READER_ARTICLE_IMAGE_CACHE_DIR: /var/lib/reader/article-images
+      READER_ARTICLE_IMAGE_CACHE_MAX_BYTES: ${READER_ARTICLE_IMAGE_CACHE_MAX_BYTES:-53687091200}
+    volumes:
+      - article-image-cache:/var/lib/reader/article-images
+    depends_on:
+      postgres:
+        condition: service_healthy
+      schema-gate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+
+  worker-llm:
+    build:
+      context: ./apps/api
+      args: *reader-build-args
+    command: ["python", "-m", "reader_api.worker"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://reader:reader@postgres:5432/reader
+      REDIS_URL: redis://redis:6379/0
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://127.0.0.1:1234}
+      LLM_MODEL: ${LLM_MODEL:-qwen/qwen3.5-9b}
+      TRANSLATION_MODEL: ${TRANSLATION_MODEL:-hy-mt2-1.8b}
+      EMBEDDING_BASE_URL: ${EMBEDDING_BASE_URL:-http://127.0.0.1:1234}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-qwen3-embedding-4b}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-240}
+      RSS_FETCH_INTERVAL_SECONDS: ${RSS_FETCH_INTERVAL_SECONDS:-1200}
+      READER_WORKER_ROLE: llm
+    depends_on:
+      postgres:
+        condition: service_healthy
+      schema-gate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_started
+
+  web:
+    build:
+      context: ./apps/web
+      args:
+        <<: *reader-build-args
+        NEXT_PUBLIC_API_URL: /api
+    environment:
+      READER_VERSION: ${READER_VERSION:-}
+      READER_COMMIT: ${READER_COMMIT:-}
+      READER_BUILD_TIME: ${READER_BUILD_TIME:-}
+      READER_DEPLOY_URL: ${READER_DEPLOY_URL:-http://127.0.0.1:3007}
+      READER_DOCS_DIR: /app/project-docs
+      NEXT_PUBLIC_API_URL: /api
+      API_INTERNAL_URL: http://api:8000
+      READER_API_TOKEN: ${READER_API_TOKEN:?Set READER_API_TOKEN}
+      NEXT_TELEMETRY_DISABLED: "1"
+    depends_on:
+      - api
+    ports:
+      - "3007:3000"
+    volumes:
+      - ./docs:/app/project-docs:ro
+
+volumes:
+  postgres-data:
+  article-image-cache:
