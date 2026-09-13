@@ -17,4 +17,4 @@ ENV READER_DEPLOY_URL=$READER_DEPLOY_URL
 COPY reader_api ./reader_api
 
 EXPOSE 8000
-CMD ["uvicorn", "reader_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "reader_api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]

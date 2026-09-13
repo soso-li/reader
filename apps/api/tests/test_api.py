@@ -19,6 +19,7 @@ from reader_api.digest import canonical_url, content_hash, lsh_signature, normal
 from reader_api.clustering_run import clustering_run  # noqa: E402
 from reader_api.cluster import repair_exact_content_duplicates  # noqa: E402
 from reader_api.discover import preview_json_entry  # noqa: E402
+from reader_api.feed_metrics import feed_trust_score
 from reader_api.public_fetch import PublicFetchResult  # noqa: E402
 from reader_api.config import Settings, settings  # noqa: E402
 from reader_api.translations import TRANSLATION_CHUNK_CHAR_LIMIT, TRANSLATION_TASK_TYPE  # noqa: E402
@@ -154,14 +155,14 @@ def create_short_cluster_fixture(*, item_status: str, generated: bool = False) -
                     object_type="item",
                     object_id=item.id,
                     read_status=item_status,
-                    read_later=True,
+                    read_later=False,
+                    starred=True,
                     updated_at=fixed_updated_at,
                 ),
             ]
         )
         session.commit()
         return cluster.id, item.id, document.id
-
 
 def test_folder_source_and_state_api() -> None:
     Base.metadata.drop_all(engine)
@@ -789,23 +790,22 @@ def test_sources_discover_passes_the_configured_rsshub_origin(monkeypatch) -> No
             url,
         )
 
-    monkeypatch.setattr(settings, "rsshub_base_url", "http://192.0.2.6:1200")
+    monkeypatch.setattr(settings, "rsshub_base_url", "http://rsshub.example.test:1200")
     monkeypatch.setattr("reader_api.discover.fetch_public_bytes", fake_fetch)
 
     response = TestClient(app).post(
         "/sources/discover",
-        json={"url": "http://192.0.2.6:1200/claude/blog"},
+        json={"url": "http://rsshub.example.test:1200/claude/blog"},
     )
 
     assert response.status_code == 200
     assert calls == [
         (
-            "http://192.0.2.6:1200/claude/blog",
-            "http://192.0.2.6:1200",
+            "http://rsshub.example.test:1200/claude/blog",
+            "http://rsshub.example.test:1200",
             10 * 1024 * 1024,
         )
     ]
-
 
 def test_sources_discover_supports_atom_and_json_feed_without_followup_requests(monkeypatch) -> None:
     calls: list[str] = []
@@ -1286,7 +1286,7 @@ def test_source_counts_use_unread_clusters_and_dedupe_folder_totals() -> None:
     assert [(source["name"], source["unread_count"], source["folder_unread_count"], source["all_unread_count"]) for source in sources] == [("A", 0, 0, 0), ("B", 0, 0, 0)]
 
 
-def test_source_unread_counts_match_explicit_article_and_media_views() -> None:
+def test_source_unread_counts_exclude_filtered_while_explicit_views_reveal() -> None:
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
@@ -1386,10 +1386,10 @@ def test_source_unread_counts_match_explicit_article_and_media_views() -> None:
     ).status_code == 200
 
     sources = {source["id"]: source for source in client.get("/sources/navigation").json()}
-    assert sources[article_source_id]["unread_count"] == 1
+    assert sources[article_source_id]["unread_count"] == 0
     assert sources[article_source_id]["folder_unread_count"] == 0
     assert sources[article_source_id]["all_unread_count"] == 0
-    assert sources[video_source_id]["unread_count"] == 1
+    assert sources[video_source_id]["unread_count"] == 0
     assert client.get(
         "/clusters/count",
         params={"source_id": article_source_id, "read_status": "unread"},
@@ -1509,7 +1509,6 @@ def test_ai_settings_exposes_local_provider_timeout() -> None:
     assert body["translation_model"] == "hy-mt2-1.8b"
     assert body["embedding_model"] == "text-embedding-qwen3-embedding-4b"
     assert body["timeout_seconds"] == 240.0
-
 
 def test_deployment_settings_reject_model_names_longer_than_storage_boundary() -> None:
     values = {
@@ -2022,7 +2021,7 @@ def test_translation_cache_isolated_by_provider_and_source_privacy(monkeypatch) 
         private_source_id = private_source.id
         session.commit()
 
-    local = client.post("/translations", json={"text": text_value})
+    local = _complete_async_translation(client, {"text": text_value})
     assert local.json()["translation"] == "local translation"
     assert client.patch(
         "/ai/settings",
@@ -2034,11 +2033,11 @@ def test_translation_cache_isolated_by_provider_and_source_privacy(monkeypatch) 
         },
     ).status_code == 200
 
-    cloud = client.post(
-        "/translations", json={"text": text_value, "source_id": public_source_id}
+    cloud = _complete_async_translation(
+        client, {"text": text_value, "source_id": public_source_id}
     )
-    private = client.post(
-        "/translations", json={"text": private_text, "source_id": private_source_id}
+    private = _complete_async_translation(
+        client, {"text": private_text, "source_id": private_source_id}
     )
 
     assert cloud.json()["translation"] == "cloud translation"
@@ -2049,7 +2048,6 @@ def test_translation_cache_isolated_by_provider_and_source_privacy(monkeypatch) 
             select(LLMTask.provider).where(LLMTask.task_type == TRANSLATION_TASK_TYPE).order_by(LLMTask.id)
         ).all()
     assert providers == ["local", "openai_compatible", "local"]
-
 
 def test_ai_settings_patch_persists_separate_model_channels(monkeypatch) -> None:
     Base.metadata.drop_all(engine)
@@ -2136,8 +2134,8 @@ def test_translation_uses_translation_model_and_cache(monkeypatch) -> None:
     client = TestClient(app)
     text_value = "Apple filed an appeal after being found in contempt of an order related to App Store fees."
 
-    first = client.post("/translations", json={"text": text_value}).json()
-    second = client.post("/translations", json={"text": text_value}).json()
+    first = _complete_async_translation(client, {"text": text_value}).json()
+    second = _complete_async_translation(client, {"text": text_value}).json()
 
     assert first["status"] == "ready"
     assert first["translation"] == "苹果与 Epic 的案件将由最高法院审理。"
@@ -2178,7 +2176,6 @@ def test_translation_uses_translation_model_and_cache(monkeypatch) -> None:
     assert item["title_translation"] == "苹果与 Epic 的案件将由最高法院审理。"
     assert item["summary_translation"] == "苹果与 Epic 的案件将由最高法院审理。"
     assert item["content_translation"] == "苹果与 Epic 的案件将由最高法院审理。"
-
 
 def test_translation_maps_rich_text_blocks_and_reuses_the_cache(monkeypatch) -> None:
     Base.metadata.drop_all(engine)
@@ -2267,8 +2264,8 @@ Revenue grew this quarter."""
     monkeypatch.setattr("reader_api.ai_runtime.LocalChatProvider", FakeProvider)
     client = TestClient(app)
 
-    first = client.post("/translations", json={"blocks": blocks})
-    second = client.post("/translations", json={"blocks": blocks})
+    first = _complete_async_translation(client, {"blocks": blocks})
+    second = _complete_async_translation(client, {"blocks": blocks})
 
     assert first.status_code == 200
     assert first.json()["blocks"] == [
@@ -2284,7 +2281,6 @@ Revenue grew this quarter."""
     assert first.json()["translation"] == "OpenAI 发布了一份新报告。\n\n本季度收入增长。"
     assert second.json() == first.json()
     assert len(calls) == 1
-
 
 def test_translation_repairs_invalid_multi_output_with_bounded_single_retries(
     monkeypatch,
@@ -2333,8 +2329,8 @@ def test_translation_repairs_invalid_multi_output_with_bounded_single_retries(
     }
     client = TestClient(app)
 
-    first = client.post("/translations", json=payload)
-    second = client.post("/translations", json=payload)
+    first = _complete_async_translation(client, payload)
+    second = _complete_async_translation(client, payload)
 
     assert first.status_code == 200
     assert first.json()["blocks"] == [
@@ -2354,7 +2350,6 @@ def test_translation_repairs_invalid_multi_output_with_bounded_single_retries(
         "Translate to Simplified Chinese (output translation only):\n\n"
         "First source block."
     )
-
 
 def test_translation_does_not_cache_after_single_retries_are_exhausted(
     monkeypatch,
@@ -2387,12 +2382,21 @@ def test_translation_does_not_cache_after_single_retries_are_exhausted(
     }
     client = TestClient(app)
 
-    assert client.post("/translations", json=payload).status_code == 502
-    assert client.post("/translations", json=payload).status_code == 502
+    assert _complete_async_translation(client, payload).json()["status"] == "error"
+    assert (
+        _complete_async_translation(client, {**payload, "retry": True}).json()["status"]
+        == "error"
+    )
     assert len(calls) == 10
     with sessionmaker(bind=engine)() as session:
-        assert session.scalar(select(func.count()).select_from(LLMTask)) == 0
-
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(LLMTask)
+                .where(LLMTask.status == "complete")
+            )
+            == 0
+        ), "重试耗尽不得写入可复用缓存"
 
 def test_translation_chunks_long_foreign_text_and_caches(monkeypatch) -> None:
     Base.metadata.drop_all(engine)
@@ -2420,14 +2424,13 @@ def test_translation_chunks_long_foreign_text_and_caches(monkeypatch) -> None:
     text_value = "\n\n".join(paragraph * 35 for _ in range(4))
     client = TestClient(app)
 
-    first = client.post("/translations", json={"text": text_value}).json()
-    second = client.post("/translations", json={"text": text_value}).json()
+    first = _complete_async_translation(client, {"text": text_value}).json()
+    second = _complete_async_translation(client, {"text": text_value}).json()
 
     assert first["status"] == "ready"
     assert first["translation"] == "\n\n".join(expected)
     assert second["translation"] == first["translation"]
     assert len(calls) > 1
-
 
 def test_detail_endpoints_return_cached_foreign_translations(monkeypatch) -> None:
     Base.metadata.drop_all(engine)
@@ -2490,7 +2493,7 @@ def test_detail_endpoints_return_cached_foreign_translations(monkeypatch) -> Non
         "Apple asks the Supreme Court to review Epic app store fees.\n\nDevelopers are watching the case closely.",
         "Apple Epic case reaches Supreme Court",
     ):
-        assert client.post("/translations", json={"text": text_value}).json()["status"] == "ready"
+        assert _complete_async_translation(client, {"text": text_value}).json()["status"] == "ready"
 
     item_detail = client.get(f"/items/{item_id}").json()
     cluster_detail = client.get(f"/clusters/{cluster_id}").json()
@@ -2504,7 +2507,6 @@ def test_detail_endpoints_return_cached_foreign_translations(monkeypatch) -> Non
     assert cluster_detail["items"][0]["content_translation"].startswith("中文译文：")
     assert any(call.endswith("Apple Epic appeal") for call in calls)
     assert any(call.endswith("Apple Epic case reaches Supreme Court") for call in calls)
-
 
 def test_reading_detail_survives_unavailable_translation_model(monkeypatch) -> None:
     Base.metadata.drop_all(engine)
@@ -2605,8 +2607,8 @@ def test_list_endpoints_return_bilingual_foreign_titles(monkeypatch) -> None:
         session.commit()
 
     client = TestClient(app)
-    assert client.post("/translations", json={"text": "Apple Epic appeal"}).json()["status"] == "ready"
-    assert client.post("/translations", json={"text": "Apple Epic case reaches Supreme Court"}).json()["status"] == "ready"
+    assert _complete_async_translation(client, {"text": "Apple Epic appeal"}).json()["status"] == "ready"
+    assert _complete_async_translation(client, {"text": "Apple Epic case reaches Supreme Court"}).json()["status"] == "ready"
     calls.clear()
 
     item_row = client.get("/items", params={"include_content": "false"}).json()[0]
@@ -2620,7 +2622,6 @@ def test_list_endpoints_return_bilingual_foreign_titles(monkeypatch) -> None:
     assert cluster_row["generated_title_translation"] == "中文译文：Apple Epic case reaches Supreme Court"
     assert cluster_row["items"][0]["title_translation"] == "中文译文：Apple Epic appeal"
     assert calls == []
-
 
 def test_item_detail_get_is_read_only_even_when_full_content_is_enabled(monkeypatch) -> None:
     Base.metadata.drop_all(engine)
@@ -2678,7 +2679,7 @@ def test_item_detail_get_is_read_only_even_when_full_content_is_enabled(monkeypa
         original_cluster_score = item.cluster_score
         fixed_updated_at = datetime(2026, 6, 1, tzinfo=timezone.utc)
         session.add(
-            UserState(object_type="item", object_id=item_id, read_status="original_opened", read_later=True, updated_at=fixed_updated_at)
+            UserState(object_type="item", object_id=item_id, read_status="original_opened", read_later=False, starred=True, updated_at=fixed_updated_at)
         )
         session.commit()
 
@@ -2707,7 +2708,6 @@ def test_item_detail_get_is_read_only_even_when_full_content_is_enabled(monkeypa
         assert item.cluster_score == original_cluster_score
         assert item.embedding_vector == "[1.0,0.0]"
         assert item.embedding_model == "old-model"
-
 
 def test_cluster_detail_get_does_not_fetch_or_translate_short_source_body(
     monkeypatch,
@@ -4043,14 +4043,15 @@ def test_report_generation_uses_clusters_and_persists(monkeypatch) -> None:
                     object_type="report",
                     object_id=report_state_key("week", report_starts["week"]),
                     read_status="original_opened",
-                    read_later=True,
+                    read_later=False,
+                    starred=True,
                     updated_at=fixed_updated_at,
                 ),
                 UserState(
                     object_type="report",
                     object_id=report_state_key("month", report_starts["month"]),
                     read_status="summary_seen",
-                    read_later=True,
+                    read_later=False,
                     starred=True,
                     updated_at=fixed_updated_at,
                 ),
@@ -4107,7 +4108,7 @@ def test_report_generation_uses_clusters_and_persists(monkeypatch) -> None:
         "report",
         saved["object_id"],
         operation_id="93010000-0000-4000-8000-000000000000",
-        read_later=True,
+        starred=True,
     )
     set_object_user_state(
         client,
@@ -4118,8 +4119,8 @@ def test_report_generation_uses_clusters_and_persists(monkeypatch) -> None:
     )
     saved = client.get("/reports", params={"period": "day", "date": "2026-06-29"}).json()
     assert saved["read_status"] == "summary_seen"
-    assert saved["read_later"] is True
     assert saved["starred"] is True
+    assert "read_later" not in saved
 
     with Session() as session:
         report_states = session.query(UserState).filter_by(object_type="report").order_by(UserState.object_id).all()
@@ -4156,7 +4157,6 @@ def test_report_generation_uses_clusters_and_persists(monkeypatch) -> None:
             .where(GenerationRequest.task_type == "report:day")
         )
         assert persisted is not None and persisted.payload_json == stored_payload
-
 
 
 
@@ -4828,7 +4828,6 @@ def test_about_reports_version_metadata_and_health(monkeypatch) -> None:
     assert about["health"]["llm"]["detail"] == "http://127.0.0.1:1234/api/v1/models"
     assert about["health"]["embedding"]["ok"] is True
 
-
 def test_article_image_proxy_serves_persistent_cache_and_reports_usage(
     monkeypatch,
     tmp_path,
@@ -4993,7 +4992,8 @@ def test_article_image_proxy_persists_failed_first_open_attempt(
 
     assert [first.status_code, second.status_code] == [502, 502]
     assert calls == [url]
-
+    assert first.headers["cache-control"] == "public, max-age=3600"
+    assert second.headers["cache-control"] == "public, max-age=3600"
 
 def test_about_reports_http_404_model_endpoints_as_unhealthy(monkeypatch) -> None:
     Base.metadata.drop_all(engine)
@@ -5171,11 +5171,13 @@ def test_favicon_endpoint_negative_cache_avoids_repeated_failure_fetches(monkeyp
     assert first.status_code == 404
     assert first.content == b""
     assert first.headers["x-reader-favicon-cache"] == "miss-negative"
+    assert first.headers["cache-control"] == (
+        "public, max-age=86400, stale-while-revalidate=86400"
+    )
     assert second.status_code == 404
     assert second.content == b""
     assert second.headers["x-reader-favicon-cache"] == "hit-negative"
     assert calls == ["missing.example"]
-
 
 def test_favicon_endpoint_rejects_private_targets_before_request(monkeypatch, tmp_path) -> None:
     monkeypatch.setenv("READER_FAVICON_CACHE_DIR", str(tmp_path))
@@ -5339,7 +5341,6 @@ def test_search_and_user_state_are_not_boolean() -> None:
     assert len(items) == 1
     assert client.get("/search", params={"q": "%"}).json() == []
     assert client.get("/search", params={"q": "_"}).json() == []
-    assert client.get("/items", params={"read_later": False}).json()[0]["id"] == items[0]["id"]
     assert client.get("/items", params={"starred": False}).json()[0]["id"] == items[0]["id"]
     cluster = client.get("/clusters").json()[0]
     assert cluster["items"][0]["source_name"] == "AI Feed"
@@ -5382,9 +5383,8 @@ def test_search_and_user_state_are_not_boolean() -> None:
     assert cluster["starred"] is True
     assert client.get("/clusters", params={"read_status": "unread"}).json() == []
     assert client.get("/clusters", params={"starred": True}).json()[0]["id"] == cluster["id"]
-    assert client.get("/clusters", params={"read_later": True}).json()[0]["id"] == cluster["id"]
     cluster_detail = client.get(f"/clusters/{cluster['id']}").json()
-    assert cluster_detail["read_later"] is True
+    assert "read_later" not in cluster_detail
     dismissed = client.patch(
         f"/user-state/cluster/{cluster['id']}",
         json={"read_status": "dismissed"},
@@ -5427,28 +5427,6 @@ def test_search_and_user_state_are_not_boolean() -> None:
     assert state["starred"] is False
     assert client.get("/sources").json()[0]["starred_count"] == 1
     assert client.get("/items", params={"starred": True}).json() == []
-    assert client.get("/items", params={"read_later": True}).json() == []
-    state = set_object_user_state(
-        client,
-        "item",
-        items[0]["id"],
-        operation_id="94030000-0000-4000-8000-000000000000",
-        read_later=True,
-    )
-    assert state["read_later"] is True
-    assert client.get("/sources").json()[0]["read_later_count"] == 2
-    assert client.get("/items", params={"read_later": True}).json()[0]["id"] == items[0]["id"]
-    state = set_object_user_state(
-        client,
-        "item",
-        items[0]["id"],
-        operation_id="94040000-0000-4000-8000-000000000000",
-        read_later=False,
-    )
-    assert state["read_later"] is False
-    assert client.get("/sources").json()[0]["read_later_count"] == 1
-    assert client.get("/items", params={"read_later": True}).json() == []
-
     state = set_object_user_state(
         client,
         "item",
@@ -5528,7 +5506,6 @@ def test_search_and_user_state_are_not_boolean() -> None:
     assert source["unread_count"] == 1
     assert source["read_count"] == 0
     assert source["opened_count"] == 0
-
 
 def test_cluster_list_returns_all_sources() -> None:
     Base.metadata.drop_all(engine)
@@ -5662,7 +5639,7 @@ def test_item_summary_generation_persists(monkeypatch) -> None:
                     object_type="item",
                     object_id=item_id,
                     read_status="unread",
-                    read_later=True,
+                    read_later=False,
                     starred=True,
                     updated_at=fixed_updated_at,
                 ),
@@ -5670,7 +5647,8 @@ def test_item_summary_generation_persists(monkeypatch) -> None:
                     object_type="report",
                     object_id=report_state_key("day", report_start),
                     read_status="summary_seen",
-                    read_later=True,
+                    read_later=False,
+                    starred=True,
                     updated_at=fixed_updated_at,
                 ),
             ]
@@ -5688,8 +5666,8 @@ def test_item_summary_generation_persists(monkeypatch) -> None:
     assert saved["summary"] == "Nvidia 发布新 AI 芯片。"
     item = client.get(f"/items/{item_id}").json()
     assert item["read_status"] == "unread"
-    assert item["read_later"] is True
     assert item["starred"] is True
+    assert "read_later" not in item
     assert user_state_snapshot() == state_before_generation
     with Session() as session:
         assert session.scalar(select(func.count(InteractionEvent.id))) == 0
@@ -5710,7 +5688,6 @@ def test_item_summary_generation_persists(monkeypatch) -> None:
         operation_id="95000000-0000-4000-8000-000000000000",
         read_status="summary_seen",
     )["read_status"] == "summary_seen"
-
 
 
 def test_assistant_answers_with_citations(monkeypatch) -> None:
@@ -5860,8 +5837,8 @@ def test_cluster_synthesis_updates_generated_fields(monkeypatch) -> None:
                     object_type="item",
                     object_id=item_id,
                     read_status="original_opened" if index == 0 else "summary_seen",
-                    read_later=index == 0,
-                    starred=index == 1,
+                    read_later=False,
+                    starred=index in {0, 1},
                     updated_at=datetime(2026, 6, 1, tzinfo=timezone.utc),
                 )
                 for index, item_id in enumerate(item_ids)
@@ -5888,7 +5865,6 @@ def test_cluster_synthesis_updates_generated_fields(monkeypatch) -> None:
         assert session.query(GenerationApplication).filter_by(status="applied").count() == 1
         assert session.query(LLMTask).count() == 0
     assert user_state_snapshot() == state_before_generation
-
 
 
 def test_cluster_synthesis_freezes_short_rss_body_without_mutating_document(monkeypatch) -> None:
@@ -6021,14 +5997,14 @@ def test_cluster_detail_read_only_does_not_turn_shared_digest_into_state_deletin
             session.add(UserState(object_type="item", object_id=item.id, read_status="summary_seen", starred=index == 1))
         session.commit()
 
-    def visible_states(api_client: TestClient) -> tuple[dict[int, tuple[str, bool, bool]], dict[int, tuple[str, bool, bool]]]:
+    def visible_states(api_client: TestClient) -> tuple[dict[int, tuple[str, bool]], dict[int, tuple[str, bool]]]:
         item_states = {
-            row["id"]: (row["read_status"], row["read_later"], row["starred"])
+            row["id"]: (row["read_status"], row["starred"])
             for row in api_client.get("/items", params={"include_content": "false"}).json()
             if row["id"] in item_ids
         }
         cluster_states = {
-            row["id"]: (row["read_status"], row["read_later"], row["starred"])
+            row["id"]: (row["read_status"], row["starred"])
             for row in api_client.get("/clusters").json()
             if row["id"] in cluster_ids
         }
@@ -6046,7 +6022,6 @@ def test_cluster_detail_read_only_does_not_turn_shared_digest_into_state_deletin
 
     assert after_items == before_items
     assert after_clusters == before_clusters
-
 
 def test_short_article_extraction_accepts_meaningful_text_under_800_chars() -> None:
     from reader_api.rss import extract_article_text
@@ -6230,7 +6205,7 @@ def test_topic_groups_track_matching_clusters() -> None:
         "topic",
         topic["id"],
         operation_id="96010000-0000-4000-8000-000000000000",
-        read_later=True,
+        starred=True,
     )
     set_object_user_state(
         client,
@@ -6241,8 +6216,8 @@ def test_topic_groups_track_matching_clusters() -> None:
     )
     assert state["read_status"] == "summary_seen"
     topic_with_state = client.get(f"/topics/{topic['id']}").json()
-    assert topic_with_state["read_later"] is True
     assert topic_with_state["starred"] is True
+    assert "read_later" not in topic_with_state
     updated = client.patch(f"/topics/{topic['id']}", json={"name": "供应商", "query": "supplier, 不存在", "description": "供应商追踪"}).json()
     assert updated["name"] == "供应商"
     assert updated["read_status"] == "summary_seen"
@@ -6253,7 +6228,6 @@ def test_topic_groups_track_matching_clusters() -> None:
     assert symbol_topic["clusters"] == []
     assert client.delete(f"/topics/{topic['id']}").status_code == 204
     assert client.get(f"/topics/{topic['id']}").status_code == 404
-
 
 def test_topic_queries_reject_database_expression_fanout() -> None:
     Base.metadata.drop_all(engine)
@@ -6512,3 +6486,301 @@ def test_duplicate_relation_does_not_change_current_list_visibility() -> None:
     }
 
     assert after == before
+
+
+def _complete_async_translation(client: TestClient, payload: dict[str, object]):
+    """#106 异步契约收敛帮手：桩掉入队，POST 得 pending 时驱动 worker
+    作业再取终态。"""
+    import reader_api.main as main_module
+    from reader_api.worker import translate_pending_task
+
+    original_enqueue = main_module.enqueue_translation_job
+    main_module.enqueue_translation_job = lambda _task_id: True
+    try:
+        response = client.post("/translations", json=payload)
+        if response.status_code != 200 or response.json().get("status") != "pending":
+            return response
+        with sessionmaker(bind=engine)() as session:
+            pending_ids = session.scalars(
+                select(LLMTask.id).where(
+                    LLMTask.task_type == TRANSLATION_TASK_TYPE,
+                    LLMTask.status == "pending",
+                )
+            ).all()
+        for task_id in pending_ids:
+            translate_pending_task(task_id)
+        return client.post(
+            "/translations", json={**payload, "retry": False}
+        )
+    finally:
+        main_module.enqueue_translation_job = original_enqueue
+
+import json
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.orm import sessionmaker
+
+from reader_api.db import Base, engine
+from reader_api.main import app
+from reader_api.models import LLMTask
+from reader_api.translations import TRANSLATION_TASK_TYPE
+from reader_api.worker import translate_pending_task
+
+TEXT = "Apple announced a new product for developers and customers worldwide."
+
+
+class _Response:
+    def __init__(self, payload: bytes) -> None:
+        self.payload = payload
+
+    def __enter__(self) -> "_Response":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def read(self, size: int = -1) -> bytes:
+        return self.payload if size < 0 else self.payload[:size]
+
+
+def _reset_database() -> None:
+    Base.metadata.drop_all(engine)
+    Base.metadata.create_all(engine)
+
+
+def _forbid_llm(monkeypatch: pytest.MonkeyPatch) -> None:
+    def guard(request, timeout: float):
+        raise AssertionError("翻译请求内不得同步调用 LLM")
+
+    monkeypatch.setattr("reader_api.llm.urlopen", guard)
+
+
+def _allow_llm(monkeypatch: pytest.MonkeyPatch, translation: str = "本地译文") -> list[str]:
+    calls: list[str] = []
+
+    def fake_urlopen(request, timeout: float) -> _Response:
+        calls.append(request.full_url)
+        return _Response(
+            json.dumps({"text": translation}, ensure_ascii=False).encode()
+        )
+
+    monkeypatch.setattr("reader_api.llm.urlopen", fake_urlopen)
+    return calls
+
+
+def _pending_tasks() -> list[LLMTask]:
+    with sessionmaker(bind=engine)() as session:
+        return session.scalars(
+            select(LLMTask).where(
+                LLMTask.task_type == TRANSLATION_TASK_TYPE,
+                LLMTask.status == "pending",
+            )
+        ).all()
+
+
+def test_translation_returns_pending_and_enqueues_once(monkeypatch) -> None:
+    _reset_database()
+    _forbid_llm(monkeypatch)
+    enqueued: list[int] = []
+    monkeypatch.setattr(
+        "reader_api.main.enqueue_translation_job",
+        lambda task_id: enqueued.append(task_id) or True,
+    )
+    client = TestClient(app)
+
+    first = client.post("/translations", json={"text": TEXT})
+    assert first.status_code == 200
+    assert first.json()["status"] == "pending"
+    assert len(enqueued) == 1
+    assert len(_pending_tasks()) == 1
+
+    second = client.post("/translations", json={"text": TEXT})
+    assert second.json()["status"] == "pending"
+    assert len(enqueued) == 1, "重复请求不得重复入队"
+    assert len(_pending_tasks()) == 1
+
+
+def test_worker_completes_pending_and_poll_returns_ready(monkeypatch) -> None:
+    _reset_database()
+    enqueued: list[int] = []
+    monkeypatch.setattr(
+        "reader_api.main.enqueue_translation_job",
+        lambda task_id: enqueued.append(task_id) or True,
+    )
+    client = TestClient(app)
+    _forbid_llm(monkeypatch)
+    assert client.post("/translations", json={"text": TEXT}).json()["status"] == "pending"
+
+    _allow_llm(monkeypatch, "工作者译文")
+    translate_pending_task(enqueued[0])
+
+    polled = client.post("/translations", json={"text": TEXT}).json()
+    assert polled["status"] == "ready"
+    assert polled["translation"] == "工作者译文"
+    assert not _pending_tasks()
+
+
+def test_block_translation_pending_flow(monkeypatch) -> None:
+    _reset_database()
+    enqueued: list[int] = []
+    monkeypatch.setattr(
+        "reader_api.main.enqueue_translation_job",
+        lambda task_id: enqueued.append(task_id) or True,
+    )
+    client = TestClient(app)
+    _forbid_llm(monkeypatch)
+    payload = {
+        "blocks": [
+            {"id": "block-0000000000000001", "text": "First English paragraph for translation."},
+            {"id": "block-0000000000000002", "text": "Second English paragraph for translation."},
+        ]
+    }
+    assert client.post("/translations", json=payload).json()["status"] == "pending"
+
+    _allow_llm(monkeypatch, "第一段译文\n%%\n第二段译文")
+    translate_pending_task(enqueued[0])
+
+    polled = client.post("/translations", json=payload).json()
+    assert polled["status"] == "ready"
+    assert [block["id"] for block in polled["blocks"]] == ["block-0000000000000001", "block-0000000000000002"]
+    assert polled["blocks"][0]["text"] == "第一段译文"
+
+
+def test_error_surfaces_and_retry_flag_requeues(monkeypatch) -> None:
+    _reset_database()
+    enqueued: list[int] = []
+    monkeypatch.setattr(
+        "reader_api.main.enqueue_translation_job",
+        lambda task_id: enqueued.append(task_id) or True,
+    )
+    client = TestClient(app)
+    _forbid_llm(monkeypatch)
+    assert client.post("/translations", json={"text": TEXT}).json()["status"] == "pending"
+
+    def broken(request, timeout: float):
+        raise OSError("LLM 不可达")
+
+    monkeypatch.setattr("reader_api.llm.urlopen", broken)
+    translate_pending_task(enqueued[0])
+
+    _forbid_llm(monkeypatch)
+    errored = client.post("/translations", json={"text": TEXT}).json()
+    assert errored["status"] == "error"
+    assert len(enqueued) == 1, "错误任务不得被普通轮询自动重排"
+
+    retried = client.post("/translations", json={"text": TEXT, "retry": True}).json()
+    assert retried["status"] == "pending"
+    assert len(enqueued) == 2
+    assert len(_pending_tasks()) == 1
+
+
+def test_enqueue_failure_returns_503(monkeypatch) -> None:
+    _reset_database()
+    _forbid_llm(monkeypatch)
+    monkeypatch.setattr(
+        "reader_api.main.enqueue_translation_job", lambda task_id: False
+    )
+    client = TestClient(app)
+    response = client.post("/translations", json={"text": TEXT})
+    assert response.status_code == 503
+    assert not _pending_tasks(), "入队失败不得留下孤儿 pending 任务"
+
+
+def test_cached_translation_stays_synchronous(monkeypatch) -> None:
+    _reset_database()
+    enqueued: list[int] = []
+    monkeypatch.setattr(
+        "reader_api.main.enqueue_translation_job",
+        lambda task_id: enqueued.append(task_id) or True,
+    )
+    client = TestClient(app)
+    _forbid_llm(monkeypatch)
+    client.post("/translations", json={"text": TEXT})
+    _allow_llm(monkeypatch, "缓存译文")
+    translate_pending_task(enqueued[0])
+
+    _forbid_llm(monkeypatch)
+    cached = client.post("/translations", json={"text": TEXT}).json()
+    assert cached["status"] == "ready"
+    assert cached["translation"] == "缓存译文"
+    assert len(enqueued) == 1
+
+
+
+
+
+
+@pytest.mark.parametrize("active", [False, True, None])
+def test_interrupted_translation_can_retry_without_replacing_live_or_unknown_job(monkeypatch, active) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    _reset_database()
+    enqueued = []
+    monkeypatch.setattr("reader_api.main.enqueue_translation_job", lambda task_id: enqueued.append(task_id) or True)
+    monkeypatch.setattr("reader_api.main.translation_job_is_active", lambda task_id: active)
+    client = TestClient(app)
+    client.post("/translations", json={"text": TEXT})
+    with sessionmaker(bind=engine)() as session:
+        task = session.get(LLMTask, enqueued[0])
+        task.updated_at = datetime.now(timezone.utc) - timedelta(minutes=20)
+        session.commit()
+
+    response = client.post("/translations", json={"text": TEXT})
+    assert response.status_code == (503 if active is None else 200)
+    if active is not None:
+        assert response.json()["status"] == ("pending" if active else "error")
+    response = client.post("/translations", json={"text": TEXT, "retry": True})
+    assert response.status_code == (503 if active is None else 200)
+    assert len(enqueued) == (2 if active is False else 1)
+    assert len(_pending_tasks()) == 1
+    if active is False:
+        _allow_llm(monkeypatch, "恢复后的译文")
+        translate_pending_task(enqueued[-1])
+        assert client.post("/translations", json={"text": TEXT}).json()["translation"] == "恢复后的译文"
+
+
+@pytest.mark.parametrize("status,age,expected", [
+    ("queued", 3600, True), ("started", 10, True), ("started", 700, False),
+    ("failed", 10, False), ("stopped", 10, False), ("finished", 10, False),
+    ("missing", 10, False),
+])
+def test_translation_queue_liveness(monkeypatch, status, age, expected) -> None:
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from rq.exceptions import NoSuchJobError
+    from reader_api.worker import translation_job_is_active
+
+    def fetch(*args, **kwargs):
+        if status == "missing":
+            raise NoSuchJobError("missing")
+        return SimpleNamespace(
+            get_status=lambda refresh: status,
+            started_at=datetime.now(timezone.utc) - timedelta(seconds=age),
+        )
+
+    monkeypatch.setattr("reader_api.worker.Job.fetch", fetch)
+    assert translation_job_is_active(1) is expected
+
+
+def test_queue_check_does_not_overwrite_a_just_completed_translation(monkeypatch) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    _reset_database()
+    enqueued = []
+    monkeypatch.setattr("reader_api.main.enqueue_translation_job", lambda task_id: enqueued.append(task_id) or True)
+    client = TestClient(app)
+    client.post("/translations", json={"text": TEXT})
+    with sessionmaker(bind=engine)() as session:
+        session.get(LLMTask, enqueued[0]).updated_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        session.commit()
+    _allow_llm(monkeypatch, "刚刚完成")
+
+    def finished(task_id):
+        translate_pending_task(task_id)
+        return False
+
+    monkeypatch.setattr("reader_api.main.translation_job_is_active", finished)
+    assert client.post("/translations", json={"text": TEXT}).json()["translation"] == "刚刚完成"
+    assert len(enqueued) == 1

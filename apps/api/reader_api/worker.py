@@ -20,17 +20,96 @@ from .db import SessionLocal, prepare_runtime_database
 from .llm import LocalEmbeddingProvider
 from .maintenance import run_scheduled_generation_retention
 from .models import ClusterItem, ContentItem, Source
+from .models import LLMTask
 from .queues import FETCH_QUEUE_NAME, LLM_QUEUE_NAME
 from .rss import fetch_enabled_sources, fetch_source, source_is_fetch_eligible
+from .translations import (
+    run_pending_translation_task,
+    translation_provider_name,
+)
 
 logger = logging.getLogger(__name__)
 FETCH_JOB_NAME = "reader_api.worker.fetch_all"
+TRANSLATION_JOB_NAME = "reader_api.worker.translate_pending_task"
+TRANSLATION_JOB_TIMEOUT_SECONDS = 600
 SOURCE_FETCH_JOB_NAME = "reader_api.worker.fetch_one"
 FETCH_ENQUEUE_LOCK_NAME = "reader:enqueue:fetch"
 ACTIVE_REFRESH_JOB_KEY = "reader:refresh:active-fetch-job"
 FETCH_RESULT_TTL_SECONDS = 24 * 60 * 60
 EMBED_JOB_NAME = "reader_api.worker.embed_all"
 WORKER_HEARTBEAT_STALE_SECONDS = 600
+
+
+def enqueue_translation_job(task_id: int) -> bool:
+    """把 pending 翻译任务排入 LLM 队列（#106）；失败返回 False 由调用方 503。"""
+    try:
+        connection = Redis.from_url(settings.redis_url)
+        Queue(LLM_QUEUE_NAME, connection=connection).enqueue(
+            translate_pending_task,
+            task_id,
+            job_id=f"reader-translation-{task_id}",
+            job_timeout=TRANSLATION_JOB_TIMEOUT_SECONDS,
+            result_ttl=3600,
+            failure_ttl=24 * 60 * 60,
+        )
+        return True
+    except Exception:
+        logger.exception("翻译任务入队失败 task_id=%s", task_id)
+        return False
+
+
+def translation_job_is_active(task_id: int) -> bool | None:
+    """None means Redis could not be checked; never expire a task on that basis."""
+    try:
+        connection = Redis.from_url(settings.redis_url)
+        job = Job.fetch(f"reader-translation-{task_id}", connection=connection)
+        status = job.get_status(refresh=True)
+        if status == "started":
+            if job.started_at is None:
+                return True
+            age = (datetime.now(timezone.utc) - job.started_at.replace(tzinfo=timezone.utc)).total_seconds()
+            return age <= TRANSLATION_JOB_TIMEOUT_SECONDS + 60
+        return status in {"queued", "deferred", "scheduled"}
+    except NoSuchJobError:
+        return False
+    except Exception:
+        logger.exception("翻译任务状态检查失败 task_id=%s", task_id)
+        return None
+
+
+def translate_pending_task(task_id: int) -> dict[str, object]:
+    """worker 内执行翻译（#106）：LLM 调用不再发生在 HTTP 请求内。"""
+    prepare_runtime_database()
+    with SessionLocal() as session:
+        task = session.get(LLMTask, task_id)
+        if task is None or task.status != "pending":
+            return {"task_id": task_id, "skipped": True}
+        source_id = None
+        try:
+            import json as _json
+
+            source_id = (_json.loads(task.result_json or "{}") or {}).get("source_id")
+        except ValueError:
+            source_id = None
+        source = session.get(Source, source_id) if source_id else None
+        ai_settings = translation_settings_for_source(
+            runtime_ai_settings(session), source
+        )
+        provider = translation_chat_provider(ai_settings)
+        derived_name = translation_provider_name(provider)
+        if (
+            provider is None
+            or derived_name != task.provider
+            or ai_settings.translation_model != task.model_version
+        ):
+            # 入队后翻译设置已变更：按新身份的轮询会另建任务，本任务终止。
+            task.status = "error"
+            task.updated_at = datetime.now(timezone.utc)
+            session.commit()
+            return {"task_id": task_id, "status": "error", "reason": "settings-changed"}
+        run_pending_translation_task(session, task, provider)
+        session.commit()
+        return {"task_id": task_id, "status": task.status}
 
 
 def fetch_all() -> dict[str, object]:
@@ -448,16 +527,21 @@ def fetch_refresh_status(
         embedding_model,
     )
     has_success = imported > 0 or completed_items > 0 or successful_sources > 0
+    has_partial_failure = fetch_failed or (
+        attempted_sources > 0 and successful_sources < attempted_sources
+    )
     if pending_articles:
         embedding_queue = Queue(LLM_QUEUE_NAME, connection=connection)
         if embed_job_exists(embedding_queue, connection):
             return "running"
-        return "complete" if has_success else "failed"
+        if not has_success:
+            return "failed"
+        return "partial" if has_partial_failure else "complete"
     if status in {"failed", "stopped", "canceled"} and not has_success:
         return "failed"
     if (fetch_failed or attempted_sources > 0) and not has_success:
         return "failed"
-    return "complete"
+    return "partial" if has_partial_failure else "complete"
 
 
 def fetch_job_result(job: Job) -> tuple[list[int], str, int, int, int, bool]:

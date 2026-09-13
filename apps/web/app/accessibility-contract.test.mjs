@@ -196,7 +196,7 @@ test("production accessibility colors and targets reuse semantic tokens", async 
   assert.match(css, /html\.reader-force-mobile input:not\(\[type="checkbox"\]\):not\(\[type="radio"\]\):not\(\[type="hidden"\]\),\s*html\.reader-force-mobile select,\s*html\.reader-force-mobile textarea\s*\{[^}]*min-height: 44px !important/s);
 });
 
-test("list-card timestamps remain interactive outside stretched row links", async () => {
+test("list-card timestamps stay static while detail timestamps retain their behavior", async () => {
   const clusterList = await readFile(new URL("./cluster-list.tsx", import.meta.url), "utf8");
   const clusterRow = await readFile(new URL("./cluster-row-link.tsx", import.meta.url), "utf8");
   const browseView = await readFile(new URL("./browse-view.tsx", import.meta.url), "utf8");
@@ -205,14 +205,14 @@ test("list-card timestamps remain interactive outside stretched row links", asyn
 
   assert.match(timeText, /interactive = true/);
   assert.match(timeText, /event\.stopPropagation\(\)/);
-  assert.doesNotMatch(clusterList, /interactive=\{false\}/);
-  assert.doesNotMatch(clusterRow, /interactive=\{false\}/);
+  assert.match(clusterList, /<TimeText interactive=\{false\}/);
+  assert.match(clusterRow, /<TimeText interactive=\{false\}/);
   assert.doesNotMatch(browseView, /interactive=\{false\}/);
   assert.match(clusterRow, /className="stretched-row-link"/);
   assert.match(browseView, /from "\.\/browse-item-card"/);
   for (const primitive of ["BrowseListRow", "BrowseImageCard", "BrowseSocialCard", "BrowseVideoCard"]) assert.match(browseCard, new RegExp(`export function ${primitive}`));
   assert.match(browseCard, /className="stretched-row-link"/);
-  assert.match(browseCard, /<TimeText interactive=\{!staticPreview\}/);
+  assert.match(browseCard, /<TimeText interactive=\{false\}/);
   assert.match(clusterRow, /className="item-title">\s*\{readStatus === "unread"[\s\S]*?className="unread-dot"[\s\S]*?<a className="stretched-row-link"/);
   assert.match(browseCard, /className="item-title">\s*\{!staticPreview && item\.read_status === "unread"[\s\S]*?<BrowseTitle/);
 });

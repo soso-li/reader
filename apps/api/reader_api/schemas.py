@@ -240,7 +240,6 @@ class SourceOut(BaseModel):
     read_count: int = 0
     opened_count: int = 0
     starred_count: int = 0
-    read_later_count: int = 0
     cluster_count: int = 0
     duplicate_count: int = 0
     recent_entry_count_30d: int = 0
@@ -315,27 +314,45 @@ class FilterRuleOut(BaseModel):
 class UserStatePatch(BaseModel):
     operation_id: str | None = Field(default=None, min_length=1, max_length=120)
     read_status: str | None = None
-    read_later: StrictBool | None = None
     starred: StrictBool | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_read_later_field(cls, value: object) -> object:
+        if not isinstance(value, dict) or "read_later" not in value:
+            return value
+        if "starred" in value:
+            raise ValueError("收藏状态不能同时提交旧字段与权威字段")
+        normalized = {**value, "starred": value["read_later"]}
+        normalized.pop("read_later", None)
+        return normalized
 
 
 class EventUserStateMutationIn(BaseModel):
     event_uid: str = Field(min_length=1, max_length=36)
     observed_revision_uid: str = Field(min_length=1, max_length=36)
     operation_id: str = Field(min_length=1, max_length=120)
-    action: str = Field(min_length=1, max_length=40)
+    action: Literal["starred_set", "read_status_set"]
     value: StrictBool | Literal["unread", "summary_seen", "original_opened"]
     source_id: int | None = Field(default=None, gt=0)
     evidence_version_uid: str | None = Field(default=None, min_length=1, max_length=36)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_read_later_action(cls, value: object) -> object:
+        if isinstance(value, dict) and value.get("action") == "read_later_set":
+            return {**value, "action": "starred_set"}
+        return value
 
 
 class EventUserStateMutationOut(BaseModel):
     operation_id: str
     event_uid: str
     observed_revision_uid: str
-    action: str
+    action: Literal["starred_set", "read_status_set"]
     value: bool | str
-    read_later: bool
     starred: bool
     updated_at: datetime
     source_id: int | None = None
@@ -345,6 +362,43 @@ class EventUserStateMutationOut(BaseModel):
     current_revision_differs_from_seen: bool | None = None
     has_material_update: bool | None = None
     material_update_revision_uid: str | None = None
+
+
+# 与 web 端收集器、/actions/event-user-state-batch 路由三处保持同步。
+EVENT_READ_BATCH_LIMIT = 50
+
+
+class EventReadBatchMarkIn(BaseModel):
+    event_uid: str = Field(min_length=1, max_length=36)
+    observed_revision_uid: str = Field(min_length=1, max_length=36)
+    operation_id: str = Field(min_length=1, max_length=120)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class EventReadBatchIn(BaseModel):
+    marks: list[EventReadBatchMarkIn] = Field(
+        min_length=1, max_length=EVENT_READ_BATCH_LIMIT
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def validate_unique_operations(self) -> "EventReadBatchIn":
+        operation_ids = [mark.operation_id for mark in self.marks]
+        if len(set(operation_ids)) != len(operation_ids):
+            raise ValueError("批量标记中的 operation_id 不得重复")
+        return self
+
+
+class EventReadBatchItemOut(BaseModel):
+    operation_id: str
+    result: EventUserStateMutationOut | None = None
+    error: str | None = None
+
+
+class EventReadBatchOut(BaseModel):
+    results: list[EventReadBatchItemOut]
 
 
 class UninterestedMutationIn(BaseModel):
@@ -578,6 +632,8 @@ class TranslationIn(BaseModel):
     source_id: int | None = Field(default=None, gt=0)
     text: str = Field(default="", max_length=100_000)
     blocks: list[TranslationBlock] = Field(default_factory=list, max_length=256)
+    # 显式重试：跳过最近失败任务的抑制重新入队（#106 异步化；Apple 端不发送）
+    retry: bool = False
 
     model_config = ConfigDict(extra="forbid")
 
@@ -630,7 +686,6 @@ class UserStateOut(BaseModel):
     object_type: str
     object_id: int
     read_status: str
-    read_later: bool
     starred: bool
 
     model_config = ConfigDict(from_attributes=True)
@@ -658,7 +713,6 @@ class ItemOut(BaseModel):
     url: str
     published_at: datetime | None
     read_status: str = "unread"
-    read_later: bool = False
     starred: bool = False
     filtered: bool = False
     filter_rules: list[str] = Field(default_factory=list)
@@ -692,7 +746,6 @@ class UninterestedTargetOut(BaseModel):
     media_type: str = "article"
     item_count: int = 1
     read_status: str = "unread"
-    read_later: bool = False
     starred: bool = False
     reason: UninterestedReason | None = None
     note: str | None = None
@@ -914,7 +967,6 @@ class EventSynthesisStateOut(EventSynthesisFreshnessOut):
 
 class EventUserStateReadOut(BaseModel):
     read_status: str
-    read_later: bool
     starred: bool
     uninterested: bool = False
     uninterested_reason: UninterestedReason | None = None
@@ -1026,7 +1078,6 @@ class ClusterOut(BaseModel):
     last_seen_at: datetime | None
     item_count: int
     read_status: str = "unread"
-    read_later: bool = False
     starred: bool = False
     uninterested: bool = False
     uninterested_reason: UninterestedReason | None = None
@@ -1070,7 +1121,6 @@ class TopicGroupOut(BaseModel):
     cluster_count: int = 0
     last_seen_at: datetime | None = None
     read_status: str = "unread"
-    read_later: bool = False
     starred: bool = False
 
 
@@ -1111,7 +1161,6 @@ class ReportOut(BaseModel):
     end: str
     object_id: int
     read_status: str = "unread"
-    read_later: bool = False
     starred: bool = False
     model_version: str = ""
     prompt_version: str = ""

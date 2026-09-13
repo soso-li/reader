@@ -10,6 +10,7 @@ import {
 } from "./event-synthesis";
 import ClusterRowLink from "./cluster-row-link";
 import { listFilterQuery } from "./list-api";
+import { withPageTimeout } from "./page-fetch-signal";
 import Favicon from "./favicon";
 import { previewText } from "./text-preview";
 import { displaySourceName } from "./source-name";
@@ -33,7 +34,6 @@ type Item = {
   url: string;
   published_at: string | null;
   read_status: string;
-  read_later: boolean;
   starred: boolean;
   filtered: boolean;
   filter_rules: string[];
@@ -50,16 +50,15 @@ type Cluster = ClusterEventIdentity & ClusterSynthesisFields & {
   last_seen_at: string | null;
   item_count: number;
   read_status: string;
-  read_later: boolean;
   starred: boolean;
   items?: Item[];
 };
 type Scope = Record<string, string | number | null | undefined>;
+const AUTO_RETRY_DELAY_MS = 1500;
 type RowOverride = Partial<
   Pick<
     Cluster,
     | "read_status"
-    | "read_later"
     | "starred"
     | "has_material_update"
     | "material_update_revision_uid"
@@ -94,11 +93,20 @@ function ClusterList({
   const [hasMore, setHasMore] = useState(initialPageCount >= pageSize);
   const [loadingMore, setLoadingMore] = useState(false);
   const [loadError, setLoadError] = useState("");
+  const [retryNonce, setRetryNonce] = useState(0);
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
   const loadingMoreRef = useRef(false);
   const rowsRef = useRef(initialRows);
   const pageRequestId = useRef(0);
   const pageAbortController = useRef<AbortController | null>(null);
+  const autoRetryCountRef = useRef(0);
+  const autoRetryTimerRef = useRef<number | null>(null);
+
+  const clearAutoRetryTimer = useCallback(() => {
+    if (autoRetryTimerRef.current === null) return;
+    window.clearTimeout(autoRetryTimerRef.current);
+    autoRetryTimerRef.current = null;
+  }, []);
 
   useEffect(() => {
     pageAbortController.current?.abort();
@@ -110,9 +118,14 @@ function ClusterList({
     setLoadingMore(false);
     setLoadError("");
     loadingMoreRef.current = false;
-  }, [initialRows, initialPageCount, offset, pageSize]);
+    clearAutoRetryTimer();
+    autoRetryCountRef.current = 0;
+  }, [clearAutoRetryTimer, initialRows, initialPageCount, offset, pageSize]);
 
-  useEffect(() => () => pageAbortController.current?.abort(), []);
+  useEffect(() => () => {
+    pageAbortController.current?.abort();
+    clearAutoRetryTimer();
+  }, [clearAutoRetryTimer]);
 
   const loadMore = useCallback(() => {
     if (loadingMoreRef.current || !hasMore) return;
@@ -123,13 +136,14 @@ function ClusterList({
     pageAbortController.current?.abort();
     pageAbortController.current = controller;
     const requestId = ++pageRequestId.current;
-    fetch(`${apiUrl.replace(/\/$/, "")}/clusters?${queryString({ ...listFilterQuery(scope.filter), folder_id: scope.folder_id, source_id: scope.source_id, q: scope.q, limit: pageSize, cursor_id: nextCursorId, order: scope.order })}`, { cache: "no-store", signal: controller.signal })
+    fetch(`${apiUrl.replace(/\/$/, "")}/clusters?${queryString({ ...listFilterQuery(scope.filter), folder_id: scope.folder_id, source_id: scope.source_id, q: scope.q, limit: pageSize, cursor_id: nextCursorId, order: scope.order })}`, { cache: "no-store", signal: withPageTimeout(controller.signal) })
       .then((response) => {
         if (!response.ok) throw new Error("更多聚类加载失败");
         return response.json();
       })
       .then((nextRows: Cluster[]) => {
         if (requestId !== pageRequestId.current) return;
+        autoRetryCountRef.current = 0;
         const existing = new Set(rowsRef.current.map((cluster) => cluster.id));
         const mergedRows = [
           ...rowsRef.current,
@@ -142,7 +156,16 @@ function ClusterList({
         setHasMore(nextRows.length >= pageSize);
       })
       .catch((error: unknown) => {
-        if (!(error instanceof DOMException && error.name === "AbortError")) setLoadError("更多聚类加载失败");
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        if (requestId !== pageRequestId.current) return;
+        setLoadError("更多聚类加载失败");
+        if (autoRetryCountRef.current === 0) {
+          autoRetryCountRef.current += 1;
+          autoRetryTimerRef.current = window.setTimeout(() => {
+            autoRetryTimerRef.current = null;
+            setRetryNonce((nonce) => nonce + 1);
+          }, AUTO_RETRY_DELAY_MS);
+        }
       })
       .finally(() => {
         if (requestId !== pageRequestId.current) return;
@@ -150,6 +173,13 @@ function ClusterList({
         setLoadingMore(false);
       });
   }, [apiUrl, hasMore, nextCursorId, onRowsChange, pageSize, scope.filter, scope.folder_id, scope.order, scope.q, scope.source_id]);
+
+  const retryLoadMore = useCallback(() => {
+    clearAutoRetryTimer();
+    setLoadError("");
+    setRetryNonce((nonce) => nonce + 1);
+    loadMore();
+  }, [clearAutoRetryTimer, loadMore]);
 
   useEffect(() => {
     const root = document.querySelector(".list-pane");
@@ -163,7 +193,7 @@ function ClusterList({
     );
     observer.observe(target);
     return () => observer.disconnect();
-  }, [hasMore, loadMore]);
+  }, [hasMore, loadMore, retryNonce]);
 
   if (!rows.length) return <div className="placeholder">暂无事件聚类。抓取 RSS 后会生成最小聚类结果。</div>;
 
@@ -182,7 +212,20 @@ function ClusterList({
         />
       ))}
       <div className="list-footer" ref={loadMoreRef}>
-        {loadingMore ? "正在加载..." : loadError || (!hasMore ? "没有更多聚类" : "")}
+        {loadingMore ? (
+          "正在加载..."
+        ) : loadError ? (
+          <>
+            {loadError}{" "}
+            <button className="list-footer-retry" onClick={retryLoadMore} type="button">
+              重试
+            </button>
+          </>
+        ) : !hasMore ? (
+          "没有更多聚类"
+        ) : (
+          ""
+        )}
       </div>
     </>
   );
@@ -222,7 +265,6 @@ const ClusterListRow = memo(function ClusterListRow({
         id={row.id}
         meta={clusterSourceMeta(row, orderedItems, eager)}
         onSelect={onSelect ? (event) => onSelect(event, row, href) : undefined}
-        readLater={row.read_later}
         readStatus={row.read_status}
         starred={row.starred}
         sources={orderedItems}
@@ -286,7 +328,7 @@ function clusterSourceMeta(cluster: Cluster, items = clusterItemsByTime(cluster.
         {status}
         {first ? <Favicon eager={eager} url={sourceIconUrl(first)} label={firstSourceName} /> : null}
         {firstSourceName ? `${firstSourceName} · ` : ""}
-        <TimeText value={firstTime} />
+        <TimeText interactive={false} value={firstTime} />
       </>
     );
   }
@@ -295,10 +337,10 @@ function clusterSourceMeta(cluster: Cluster, items = clusterItemsByTime(cluster.
       {status}
       首发 {first ? <Favicon eager={eager} url={sourceIconUrl(first)} label={firstSourceName} /> : null}
       {firstSourceName ? `${firstSourceName} · ` : ""}
-      <TimeText value={firstTime} />
+      <TimeText interactive={false} value={firstTime} />
       {lastTime && lastTime !== firstTime ? (
         <>
-          {" · "}最新 <TimeText value={lastTime} />
+          {" · "}最新 <TimeText interactive={false} value={lastTime} />
         </>
       ) : null}
     </>

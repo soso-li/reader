@@ -76,7 +76,6 @@ type Source = {
   read_count: number;
   opened_count: number;
   starred_count: number;
-  read_later_count: number;
   cluster_count: number;
   duplicate_count: number;
   recent_entry_count_30d: number;
@@ -137,7 +136,6 @@ type Item = {
   url: string;
   published_at: string | null;
   read_status: string;
-  read_later: boolean;
   starred: boolean;
   filtered: boolean;
   filter_rules: string[];
@@ -186,7 +184,6 @@ type Cluster = ClusterEventIdentity & ClusterSynthesisFields & {
   last_seen_at: string | null;
   item_count: number;
   read_status: string;
-  read_later: boolean;
   starred: boolean;
   items?: Item[];
 };
@@ -206,7 +203,6 @@ type ReportSnapshot = {
   prompt_version?: string;
   object_id: number;
   read_status: string;
-  read_later: boolean;
   starred: boolean;
 };
 type TopicGroup = {
@@ -217,7 +213,6 @@ type TopicGroup = {
   cluster_count: number;
   last_seen_at: string | null;
   read_status: string;
-  read_later: boolean;
   starred: boolean;
   clusters?: Cluster[];
 };
@@ -257,7 +252,8 @@ export default async function Page({ searchParams }: { searchParams: Promise<Sea
   const assistantAsk = one(params.assistant_ask) ?? "";
   const skipSeen = one(params.skip_seen) === "1";
   const filter = one(params.filter);
-  const currentFilter = filter === "all" ? "" : filter && ["unread", "dismissed", "read_later", "starred"].includes(filter) ? filter : "unread";
+  const normalizedFilter = filter === "read_later" ? "starred" : filter;
+  const currentFilter = normalizedFilter === "all" ? "" : normalizedFilter && ["unread", "dismissed", "starred"].includes(normalizedFilter) ? normalizedFilter : "unread";
   const currentFilterParam = currentFilter || "all";
   const settingsStatus = one(params.settings_status) ?? "";
   const currentSettingsStatus = SOURCE_STATUS_FILTERS.some(([value]) => value === settingsStatus) ? settingsStatus : "";
@@ -298,7 +294,7 @@ export default async function Page({ searchParams }: { searchParams: Promise<Sea
   const readingView = currentView === "clusters" || currentView === "browse";
   const requestedBrowseMedia = one(params.media);
   const invalidBrowseMedia = currentView === "browse" && Boolean(requestedBrowseMedia) && browseMediaParam(requestedBrowseMedia) !== requestedBrowseMedia;
-  const invalidReadingFilter = readingView && Boolean(filter) && filter !== "all" && !["unread", "dismissed", "read_later", "starred"].includes(filter ?? "");
+  const invalidReadingFilter = readingView && Boolean(normalizedFilter) && normalizedFilter !== "all" && !["unread", "dismissed", "starred"].includes(normalizedFilter ?? "");
   const invalidReadingPane = readingView && Boolean(requestedMobilePane) && !["sources", "list", "detail"].includes(requestedMobilePane ?? "");
   const invalidReadingNumber = readingView && (
     [params.folder_id, params.source_id, currentView === "clusters" ? params.cluster_id : params.item_id]
@@ -595,7 +591,6 @@ export default async function Page({ searchParams }: { searchParams: Promise<Sea
             <div className="toolbar">
               <StateForm objectType="topic" object={topicDetail} readStatus={isSeenStatus(topicDetail.read_status) ? "unread" : "summary_seen"} label={isSeenStatus(topicDetail.read_status) ? "标记未读" : "标记看过"} />
               {topicDetail.read_status !== "dismissed" ? <StateForm objectType="topic" object={topicDetail} readStatus="dismissed" label="忽略" /> : null}
-              <StateForm objectType="topic" object={topicDetail} readLater={!topicDetail.read_later} label="稍后阅读" />
               <StateForm objectType="topic" object={topicDetail} starred={!topicDetail.starred} icon />
             </div>
             <p className="section-title">Story Line</p>
@@ -1009,7 +1004,6 @@ function ReportView({ report, currentPeriod, reportDate, reportError }: { report
           <div className="toolbar">
             <StateForm objectType="report" object={{ id: report.object_id, starred: report.starred }} readStatus={isSeenStatus(report.read_status) ? "unread" : "summary_seen"} label={isSeenStatus(report.read_status) ? "标记未读" : "标记看过"} />
             {report.read_status !== "dismissed" ? <StateForm objectType="report" object={{ id: report.object_id, starred: report.starred }} readStatus="dismissed" label="忽略" /> : null}
-            <StateForm objectType="report" object={{ id: report.object_id, starred: report.starred }} readLater={!report.read_later} label="稍后阅读" />
             <StateForm objectType="report" object={{ id: report.object_id, starred: report.starred }} starred={!report.starred} icon />
           </div>
           <h2>{reportTitle}</h2>
@@ -1059,7 +1053,6 @@ function StateForm({
   object,
   objectType = "item",
   readStatus,
-  readLater,
   starred,
   label,
   icon
@@ -1067,20 +1060,18 @@ function StateForm({
   object: { id: number; starred: boolean };
   objectType?: "item" | "report" | "topic";
   readStatus?: string;
-  readLater?: boolean;
   starred?: boolean;
   label?: string;
   icon?: boolean;
 }) {
-  const title = icon ? "星标" : label || "操作";
-  const active = label === "标记未读" || readLater === false || (icon && object.starred);
+  const title = icon ? "收藏" : label || "操作";
+  const active = label === "标记未读" || (icon && object.starred);
   return (
     <form action="/actions/user-state" method="post">
       <input type="hidden" name="object_type" value={objectType} />
       <input type="hidden" name="object_id" value={object.id} />
       <input type="hidden" name="operation_id" value={randomUUID()} />
       {readStatus ? <input type="hidden" name="read_status" value={readStatus} /> : null}
-      {readLater !== undefined ? <input type="hidden" name="read_later" value={String(readLater)} /> : null}
       {starred !== undefined ? <input type="hidden" name="starred" value={String(starred)} /> : null}
       <button className={`icon ${active ? "active" : ""}`} title={title} aria-label={title}>
         {icon ? <Star size={17} fill={object.starred ? "currentColor" : "none"} /> : stateActionIcon(label, active)}
@@ -1235,7 +1226,6 @@ function isSeenStatus(status: string) {
 function clusterFilterQuery(filter: string) {
   return {
     read_status: filter === "unread" || filter === "dismissed" ? filter : undefined,
-    read_later: filter === "read_later" ? "true" : undefined,
     starred: filter === "starred" ? "true" : undefined
   };
 }

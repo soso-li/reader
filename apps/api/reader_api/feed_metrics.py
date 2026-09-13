@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal, ROUND_HALF_UP
+
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -80,16 +82,16 @@ def feed_trust_score(
     duplicate_count: int = 0,
 ) -> float:
     fetched = max(metric.fetched_count or 0, 1)
-    value = (
+    numerator = (
         (metric.read_count or 0)
         + (metric.opened_count or 0) * 2
         + (metric.starred_count or 0) * 3
-        + (metric.read_later_count or 0)
         + cluster_count
         - duplicate_count
-    ) * 100 / fetched
-    value = max(value, 0.0)
-    return round(min(value, 100.0), 1)
+    )
+    value = Decimal(numerator * 100) / Decimal(fetched)
+    bounded = min(max(value, Decimal(0)), Decimal(100))
+    return float(bounded.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
 
 
 def refresh_source_trust_score(
@@ -110,14 +112,14 @@ def project_item_user_state_metrics(
     session: Session,
     source_id: int,
     state: UserState,
-    previous: tuple[str, bool, bool],
+    previous: tuple[str, bool],
     *,
     locked: tuple[Source, FeedMetric] | None = None,
 ) -> dict[str, int]:
     """Project one item state transition and return its auditable deltas."""
 
     source, metric = locked or locked_feed_metric(session, source_id)
-    previous_status, previous_read_later, previous_starred = previous
+    previous_status, previous_starred = previous
     deltas: dict[str, int] = {}
 
     def apply_delta(field: str, delta: int) -> None:
@@ -137,8 +139,6 @@ def project_item_user_state_metrics(
 
     if state.starred != previous_starred:
         apply_delta("starred_count", 1 if state.starred else -1)
-    if state.read_later != previous_read_later:
-        apply_delta("read_later_count", 1 if state.read_later else -1)
 
     refresh_source_trust_score(session, source, metric)
     return deltas

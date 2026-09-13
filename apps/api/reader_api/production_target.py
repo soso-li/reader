@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from ipaddress import ip_address
+import os
 import re
 import socket
 from urllib.parse import unquote, urlsplit
@@ -14,6 +15,7 @@ from .migrations.database_url import parse_postgres_database_url
 
 KNOWN_PRODUCTION_DATABASES = frozenset({"reader"})
 KNOWN_PRODUCTION_HOSTS = frozenset({"postgres", "reader-postgres"})
+PRODUCTION_HOSTS_ENV = "READER_PRODUCTION_HOSTS"
 MAINTENANCE_ID_PATTERN = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$"
 )
@@ -49,19 +51,29 @@ class ProductionTargetIdentity:
         )
 
 
-def production_target_identity(database_url: str) -> ProductionTargetIdentity:
+def production_target_identity(
+    database_url: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> ProductionTargetIdentity:
     url = parse_postgres_database_url(database_url)
     if not url.host:
         raise ValueError("PostgreSQL 数据库地址必须显式包含 host")
     host = _canonical_database_host(url.host)
     database = url.database or ""
+    environment = os.environ if environ is None else environ
+    configured_hosts = {
+        _canonical_database_host(value.strip())
+        for value in environment.get(PRODUCTION_HOSTS_ENV, "").split(",")
+        if value.strip()
+    }
     return ProductionTargetIdentity(
         url=url,
         host=host,
         port=int(url.port or 5432),
         database=database,
         username=url.username or "",
-        known_production_host=host in KNOWN_PRODUCTION_HOSTS,
+        known_production_host=host in KNOWN_PRODUCTION_HOSTS | configured_hosts,
         known_production_database=(
             database.lower() in KNOWN_PRODUCTION_DATABASES
         ),

@@ -64,4 +64,4 @@
 
 ## Schema 与部署
 
-当前 Alembic head 为 `0072_reading_body_contract`。API 和 worker 启动只检查 schema head，不自动迁移；数据库升级应作为独立维护步骤执行。仓库根目录的 Compose 文件提供通用自托管入口。
+当前 Alembic head 为 `0075_stream_hot_path_indexes`，当前为唯一代码 head。0073 合并历史收藏状态，0074 为新证据冻结阅读 HTML，0075 增加列表查询索引。API 和 worker 启动只检查 schema head，不自动迁移；数据库升级应作为独立维护步骤执行。仓库根目录的 Compose 文件提供通用自托管入口。

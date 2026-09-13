@@ -219,10 +219,14 @@ test("browse card bodies reuse their title links without hijacking controls", as
       assert.match(mounted.container.textContent, /浏览标题/);
       await act(async () => mounted.container.querySelector(card.body)?.click());
       assert.equal(selections, 1);
-      await act(async () => mounted.container.querySelector("time")?.click());
-      assert.equal(selections, 1);
+      const time = mounted.container.querySelector("time");
+      const label = time.textContent;
+      assert.equal(time.getAttribute("role"), null);
+      await act(async () => time.click());
+      assert.equal(time.textContent, label);
+      assert.equal(selections, 2);
       await act(async () => mounted.container.querySelector("button")?.click());
-      assert.equal(selections, 1);
+      assert.equal(selections, 2);
     } finally {
       await mounted.unmount();
     }

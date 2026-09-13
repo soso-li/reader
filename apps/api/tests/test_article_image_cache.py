@@ -1,4 +1,5 @@
 import fcntl
+import json
 import os
 import ssl
 import threading
@@ -8,11 +9,13 @@ from lxml.html import fragment_fromstring
 
 from reader_api.article_image_cache import (
     ArticleImageCache,
+    DEFAULT_IMAGE_FAILURE_RETRY_SECONDS,
     DownloadBudget,
     DownloadedImage,
     MAX_IMAGE_BYTES,
     cache_key_for_url,
     download_image,
+    image_failure_retry_seconds,
     prepare_reading_images,
 )
 
@@ -156,6 +159,55 @@ def test_chongdiantou_legacy_proxy_failure_gets_one_new_policy_attempt(tmp_path)
     assert cache.proxy_attempted(key) is False
     cache.mark_proxy_attempted(url)
     assert cache.proxy_attempted(key) is True
+
+
+def test_proxy_failure_marker_expires_after_retry_window(tmp_path) -> None:
+    cache = ArticleImageCache(tmp_path, max_bytes=1024)
+    url = "https://cdn.example.com/broken.jpg"
+    key = cache_key_for_url(url)
+
+    cache.mark_proxy_attempted(url)
+    assert cache.proxy_attempted(key) is True
+
+    expired_at = time.time() - image_failure_retry_seconds() - 1
+    (tmp_path / f"{key}.json").write_text(
+        json.dumps(
+            {
+                "url": url,
+                "content_type": "",
+                "proxy_attempted": True,
+                "proxy_attempted_at": expired_at,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert cache.proxy_attempted(key) is False
+
+    cache.mark_proxy_attempted(url)
+    assert cache.proxy_attempted(key) is True
+
+
+def test_legacy_proxy_failure_marker_without_timestamp_expires_once(tmp_path) -> None:
+    cache = ArticleImageCache(tmp_path, max_bytes=1024)
+    url = "https://cdn.example.com/legacy-broken.jpg"
+    key = cache_key_for_url(url)
+    (tmp_path / f"{key}.json").write_text(
+        f'{{"url":"{url}","content_type":"","proxy_attempted":true}}',
+        encoding="utf-8",
+    )
+
+    assert cache.proxy_attempted(key) is False
+    cache.mark_proxy_attempted(url)
+    assert cache.proxy_attempted(key) is True
+
+
+def test_image_failure_retry_seconds_env_override(monkeypatch) -> None:
+    monkeypatch.setenv("READER_IMAGE_FAILURE_RETRY_SECONDS", "120")
+    assert image_failure_retry_seconds() == 120
+    monkeypatch.setenv("READER_IMAGE_FAILURE_RETRY_SECONDS", "not-a-number")
+    assert (
+        image_failure_retry_seconds() == DEFAULT_IMAGE_FAILURE_RETRY_SECONDS
+    )
 
 
 def test_cache_evicts_least_recent_body_but_keeps_original_url_metadata(

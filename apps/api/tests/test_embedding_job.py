@@ -1307,6 +1307,20 @@ def test_pull_refresh_waits_for_new_article_embedding_and_accepts_partial_succes
             connection=object(),
         ) == "failed"
 
+        JobLookup.current = FetchJob(
+            "finished",
+            {
+                "attempted_sources": 2,
+                "successful_sources": 1,
+                "imported": 0,
+            },
+        )
+        assert worker.fetch_refresh_status(
+            session,
+            "fetch-job",
+            connection=object(),
+        ) == "partial"
+
         stale_job = FetchJob("started", None)
         stale_job.last_heartbeat = datetime.now(timezone.utc) - timedelta(
             seconds=worker.WORKER_HEARTBEAT_STALE_SECONDS + 1

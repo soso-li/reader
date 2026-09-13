@@ -28,7 +28,6 @@ export type BrowseCardItem = {
   url: string;
   published_at: string | null;
   read_status: string;
-  read_later: boolean;
   starred: boolean;
   filtered: boolean;
   filter_rules: string[];
@@ -60,8 +59,7 @@ export function BrowseListRow({ item, active = false, eagerFavicon = false, href
         {browseMediaBadge(item) ? <span className="badge">{browseMediaBadge(item)}</span> : null}
         {emptyMediaLabel && (requiredMediaKind ? item.media_kind !== requiredMediaKind : !item.media_url) ? <span className="badge">{emptyMediaLabel}</span> : null}
         {!staticPreview && item.read_status === "original_opened" ? <span className="badge">已打开原文</span> : null}
-        {!staticPreview && item.read_later ? <span className="badge">稍后</span> : null}
-        {!staticPreview && item.starred ? <span className="badge">星标</span> : null}
+        {!staticPreview && item.starred ? <span className="badge">收藏</span> : null}
         {!staticPreview && item.filtered ? <span className="badge filtered-badge" title={item.filter_rules.join("；")}>已过滤</span> : null}
       </div>
     </>
@@ -102,7 +100,7 @@ export function BrowseSocialCard({ item, active = false, eagerFavicon = false, h
       {!staticPreview && item.read_status === "unread" ? <span className="browse-feed-dot" aria-hidden="true" /> : null}
       <div className="browse-social-avatar"><Favicon eager={eagerFavicon} url={browseSourceIconUrl(item)} label={browseSourceName(item)} /></div>
       <div className="browse-social-content">
-        <div className="browse-social-meta"><strong>{browseSourceName(item)}</strong><span>·</span><TimeText interactive={!staticPreview} value={item.published_at} /></div>
+        <div className="browse-social-meta"><strong>{browseSourceName(item)}</strong><span>·</span><TimeText interactive={false} value={item.published_at} /></div>
         <strong className="browse-social-title"><BrowseTitle href={href} onNavigate={onNavigate}><BrowseTranslatedTitle item={item} /></BrowseTitle></strong>
         <p>{browseSummary(item)}</p>
         {imageUrl ? <div className="browse-social-image"><BrowseImageTileImage url={imageUrl} /></div> : emptyMediaLabel ? <span className="browse-preview-missing-media">{emptyMediaLabel}</span> : null}
@@ -158,7 +156,7 @@ function BrowseTranslatedTitle({ item }: { item: BrowseCardItem }) {
 }
 
 function BrowseMeta({ item, eager, staticPreview }: { item: BrowseCardItem; eager: boolean; staticPreview: boolean }) {
-  return <span className="item-meta item-meta-source"><Favicon eager={eager} url={browseSourceIconUrl(item)} label={browseSourceName(item)} /><span>{browseSourceName(item)}</span><span>·</span><TimeText interactive={!staticPreview} value={item.published_at} /></span>;
+  return <span className="item-meta item-meta-source"><Favicon eager={eager} url={browseSourceIconUrl(item)} label={browseSourceName(item)} /><span>{browseSourceName(item)}</span><span>·</span><TimeText interactive={false} value={item.published_at} /></span>;
 }
 
 function BrowseRowThumbnail({ label, url }: { label: string; url: string }) {

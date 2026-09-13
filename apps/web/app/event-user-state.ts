@@ -1,6 +1,6 @@
 "use client";
 
-export type EventSavedStateAction = "starred_set" | "read_later_set";
+export type EventSavedStateAction = "starred_set";
 export type EventReadStatus = "unread" | "summary_seen" | "original_opened";
 export type EventUserStateAction = EventSavedStateAction | "read_status_set";
 
@@ -28,7 +28,6 @@ type EventUserStateMutationResultBase = {
   event_uid: string;
   observed_revision_uid: string;
   operation_id: string;
-  read_later: boolean;
   starred: boolean;
   updated_at: string;
 };
@@ -54,7 +53,6 @@ export type EventUserStateMutationResult = EventUserStateMutationResultBase &
 
 export type ConfirmedEventStatePatch =
   | { starred: boolean }
-  | { read_later: boolean }
   | {
       read_status: string;
       seen_revision_uid: string | null;
@@ -163,9 +161,6 @@ export function confirmedEventStatePatch(
   result: EventUserStateMutationResult
 ): ConfirmedEventStatePatch {
   if (result.action === "starred_set") return { starred: result.starred };
-  if (result.action === "read_later_set") {
-    return { read_later: result.read_later };
-  }
   if (!("read_status" in result)) {
     throw new Error("事件状态回应缺少阅读结果");
   }

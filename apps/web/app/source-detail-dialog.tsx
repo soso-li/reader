@@ -32,7 +32,6 @@ export type SourceDetailSource = {
   read_count: number;
   opened_count: number;
   starred_count: number;
-  read_later_count: number;
   cluster_count: number;
   duplicate_count: number;
   recent_entry_count_30d: number;
@@ -452,7 +451,7 @@ export default function SourceDetailDialog({
           </section>
           <aside className="source-detail-side">
             <section aria-label="监控"><h3>监控</h3><dl className="source-detail-values"><Value label="最近抓取" value={formatExactTime(source.last_fetched_at)} /><Value label="近 30 天" value={recentEntryLabel(source.recent_entry_count_30d)} /><Value label="Feed 地址" value={draft.url} /><Value label="来源 ID" value={String(source.id)} /></dl>{source.last_error ? <div className="source-detail-error"><strong>{friendlyFetchError(source.last_error)}</strong></div> : <p className="source-detail-healthy">当前没有抓取错误。</p>}<div className="source-detail-monitor-actions"><button disabled={busy} type="button" onClick={() => void refetch()}><RefreshCw size={15} /> 重新抓取</button><button disabled={busy} type="button" onClick={() => addressInputRef.current?.focus()}><Pencil size={15} /> 修改链接</button></div></section>
-            <section aria-label="价值"><h3>价值</h3><dl className="source-detail-values"><Value label="星标" value={String(source.starred_count)} /><Value label="打开原文" value={String(source.opened_count)} /><Value label="入簇" value={String(source.cluster_count)} /><Value label="重复" value={String(source.duplicate_count)} /><Value label="信任分" value={`${Number(source.feed_trust_score ?? 0).toFixed(1)} / 100`} /></dl><p className="source-detail-trust">信任分范围 0–100，按（已读 + 2×打开原文 + 3×星标 + 稍后读 + 入簇 - 重复）×100 / max（抓取数，1）计算。</p></section>
+            <section aria-label="价值"><h3>价值</h3><dl className="source-detail-values"><Value label="收藏" value={String(source.starred_count)} /><Value label="打开原文" value={String(source.opened_count)} /><Value label="入簇" value={String(source.cluster_count)} /><Value label="重复" value={String(source.duplicate_count)} /><Value label="信任分" value={`${Number(source.feed_trust_score ?? 0).toFixed(1)} / 100`} /></dl><p className="source-detail-trust">信任分范围 0–100，按（已读 + 2×打开原文 + 3×收藏 + 入簇 - 重复）×100 / max（抓取数，1）计算。</p></section>
           </aside>
           <footer className="source-detail-footer">{feedback ? <p className={feedback.kind === "error" ? "error-line" : "status-line success-line"} role={feedback.kind === "error" ? "alert" : "status"}>{feedback.message}</p> : <span>{dirty ? "有未保存更改" : ""}</span>}<button className="primary" disabled={busy || Boolean(selectorError)} type="submit">保存</button></footer>
         </form>

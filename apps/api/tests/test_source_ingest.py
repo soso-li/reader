@@ -1143,3 +1143,26 @@ def test_document_can_move_to_new_raw_revision_without_deleting_old_raw() -> Non
         assert session.get(RawEntry, old_raw_id) is not None
         assert session.get(RawEntry, new_raw_id) is not None
         assert session.get(Document, document.id).raw_entry_id == new_raw_id
+
+
+@pytest.mark.parametrize("field", ["title", "summary"])
+def test_metadata_revision_refreshes_filter_matches_in_both_directions(field: str) -> None:
+    from reader_api.models import FilterMatch, FilterRule
+
+    Base.metadata.drop_all(engine)
+    Base.metadata.create_all(engine)
+    with sessionmaker(bind=engine)() as session:
+        source = Source(name="Filter revisions", url="https://example.com/filters.xml", status="trial")
+        session.add_all([source, FilterRule(pattern="sponsored")])
+        session.flush()
+        for value, expected in [("Ordinary", 0), ("Sponsored", 1), ("Ordinary again", 0)]:
+            metadata = {"title": "Stable title", "summary": "Stable summary", field: value}
+            entry = IngestEntry(
+                external_id="filter-revision", source_guid="filter-revision",
+                url="https://example.com/filter-revision", content_text="Stable body.",
+                raw_content="<p>Stable body.</p>", raw_summary=metadata["summary"], **metadata,
+            )
+            ingest_source_entries(session, source, [entry])
+            session.commit()
+            assert session.scalar(select(func.count()).select_from(FilterMatch)) == expected
+            assert session.scalars(select(ContentItem)).one().content_text == "Stable body."

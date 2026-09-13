@@ -701,6 +701,11 @@ def update_normal_article_projection(
     title = prepared.revision.title or ""
     text = prepared.raw_text
     text_changed = item.content_text != text
+    filter_changed = (
+        text_changed
+        or item.title != title
+        or item.summary != clean_preview(prepared.summary, 500)
+    )
     document.raw_entry = raw
     document.title = title
     document.summary = prepared.summary
@@ -737,7 +742,7 @@ def update_normal_article_projection(
                 if cluster is not None:
                     refresh_cluster_dates_from_items(session, cluster)
     session.flush()
-    if text_changed:
+    if filter_changed:
         refresh_filter_matches_for_items(session, [item.id])
     return text_changed
 

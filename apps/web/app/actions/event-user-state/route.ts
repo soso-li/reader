@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server.js";
 
 import { apiFetch, userFacingErrorMessage } from "../../lib/api";
 
@@ -11,16 +11,19 @@ type EventUserStatePayload = {
   source_id?: unknown;
 };
 
-const savedActions = new Set(["starred_set", "read_later_set"]);
+const savedActions = new Set(["starred_set"]);
 const readStatuses = new Set(["unread", "summary_seen", "original_opened"]);
 
 export async function POST(request: NextRequest) {
   const body = (await request.json().catch(() => null)) as EventUserStatePayload | null;
+  const normalizedBody = body?.action === "read_later_set"
+    ? { ...body, action: "starred_set" }
+    : body;
   if (
-    typeof body?.event_uid !== "string" ||
-    typeof body?.observed_revision_uid !== "string" ||
-    typeof body?.operation_id !== "string" ||
-    !validOperation(body)
+    typeof normalizedBody?.event_uid !== "string" ||
+    typeof normalizedBody?.observed_revision_uid !== "string" ||
+    typeof normalizedBody?.operation_id !== "string" ||
+    !validOperation(normalizedBody)
   ) {
     return NextResponse.json({ error: "Event 状态操作无效" }, { status: 400 });
   }
@@ -29,7 +32,7 @@ export async function POST(request: NextRequest) {
     const result = await apiFetch<Record<string, unknown>>("/event-user-state", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
+      body: JSON.stringify(normalizedBody)
     });
     return NextResponse.json(result);
   } catch (error) {

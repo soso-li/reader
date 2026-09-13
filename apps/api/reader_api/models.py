@@ -421,6 +421,7 @@ def _validate_document_reading_body_state(
 
 class ContentItem(Base):
     __tablename__ = "content_items"
+    __table_args__ = (Index("ix_content_items_source_id", "source_id"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     document_id: Mapped[int] = mapped_column(ForeignKey("documents.id"), nullable=False)
@@ -506,6 +507,11 @@ class ContentEmbedding(Base):
 
 class Cluster(Base):
     __tablename__ = "clusters"
+    # PG 真实索引由 0075 迁移携带 NULLS LAST；SQLite create_all 不支持该子句，
+    # 镜像只保留 DESC 排序（索引在 SQLite 测试中无语义差异）。
+    __table_args__ = (
+        Index("ix_clusters_stream_order", text("first_seen_at DESC"), text("id DESC")),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     cluster_key: Mapped[str] = mapped_column(String(80), unique=True, nullable=False)
@@ -525,7 +531,10 @@ class Cluster(Base):
 
 class ClusterItem(Base):
     __tablename__ = "cluster_items"
-    __table_args__ = (UniqueConstraint("cluster_id", "content_item_id", name="uq_cluster_item"),)
+    __table_args__ = (
+        UniqueConstraint("cluster_id", "content_item_id", name="uq_cluster_item"),
+        Index("ix_cluster_items_content_item_id", "content_item_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     cluster_id: Mapped[int] = mapped_column(ForeignKey("clusters.id"), nullable=False)
@@ -666,6 +675,7 @@ class EventEvidence(Base):
 
 class EventEvidenceVersion(Base):
     __tablename__ = "event_evidence_versions"
+    __mapper_args__ = {"eager_defaults": False}
     __table_args__ = (
         ForeignKeyConstraint(
             ["evidence_id", "source_entry_id", "fragment_fingerprint"],
@@ -731,6 +741,9 @@ class EventEvidenceVersion(Base):
         DateTime(timezone=True), nullable=True
     )
     content_snapshot: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    reading_html_snapshot: Mapped[str | None] = mapped_column(
+        Text, nullable=True, deferred=True, server_default=FetchedValue()
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=now_utc
     )
@@ -1514,6 +1527,10 @@ class UserState(Base):
             name="ck_user_state_event_authority",
         ),
         CheckConstraint(
+            "read_later = false",
+            name="ck_user_state_read_later_retired",
+        ),
+        CheckConstraint(
             "uninterested_reason IS NULL OR uninterested_reason IN "
             "('promotion', 'repetitive', 'topic', 'low_quality', 'other')",
             name="ck_user_state_uninterested_reason",
@@ -1621,6 +1638,10 @@ class EventUserState(Base):
             ondelete="RESTRICT",
         ),
         CheckConstraint(
+            "read_later = false",
+            name="ck_event_user_state_read_later_retired",
+        ),
+        CheckConstraint(
             "uninterested_reason IS NULL OR uninterested_reason IN "
             "('promotion', 'repetitive', 'topic', 'low_quality', 'other')",
             name="ck_event_user_state_uninterested_reason",
@@ -1722,6 +1743,10 @@ class FeedMetric(Base):
     __tablename__ = "feed_metrics"
     __table_args__ = (
         UniqueConstraint("source_id", name="uq_feed_metric_source"),
+        CheckConstraint(
+            "read_later_count = 0",
+            name="ck_feed_metric_read_later_retired",
+        ),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)

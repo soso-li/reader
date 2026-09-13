@@ -103,7 +103,7 @@ test("valid detail panes survive reload and fetch their selected item", async ()
     const url = new URL(String(input));
     calls.push(`${url.pathname}${url.search}`);
     if (url.pathname === "/items/34") {
-      return Response.json({ id: 34, title: "详情", source_name: "测试", read_status: "unread", starred: false, read_later: false, filtered: false, filter_rules: [] });
+      return Response.json({ id: 34, title: "详情", source_name: "测试", read_status: "unread", starred: false, filtered: false, filter_rules: [] });
     }
     if (url.pathname === "/browse/summary") return Response.json([]);
     if (url.pathname === "/items/count") return Response.json({ count: 0 });
@@ -155,7 +155,7 @@ test("item deep links redirect to the source media surface", async () => {
       return Response.json([{ id: 91, folder_id: null, media_type: "podcast", status: "active", enabled: true }]);
     }
     if (url.pathname === "/items/20594") {
-      return Response.json({ id: 20594, source_id: 91, title: "播客", source_name: "测试", read_status: "unread", starred: false, read_later: false, filtered: false, filter_rules: [] });
+      return Response.json({ id: 20594, source_id: 91, title: "播客", source_name: "测试", read_status: "unread", starred: false, filtered: false, filter_rules: [] });
     }
     if (url.pathname === "/pipeline/status") return Response.json({ completed_at: null });
     return Response.json([]);

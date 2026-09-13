@@ -618,7 +618,6 @@ function FeedPreview({ busy, discovery, previewType, setPreviewType }: { busy: b
     url: entry.url,
     published_at: entry.published_at,
     read_status: "unread",
-    read_later: false,
     starred: false,
     filtered: false,
     filter_rules: []

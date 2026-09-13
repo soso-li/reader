@@ -65,13 +65,13 @@ export function listFilterQuery(filter: ListScope[string]) {
   const value = normalizeListFilter(typeof filter === "string" ? filter : "");
   return {
     read_status: value === "unread" || value === "dismissed" ? value : undefined,
-    read_later: value === "read_later" ? "true" : undefined,
     starred: value === "starred" ? "true" : undefined
   };
 }
 
 export function normalizeListFilter(filter: string | null) {
   if (filter === "all") return "";
-  if (filter && ["unread", "dismissed", "read_later", "starred"].includes(filter)) return filter;
+  if (filter === "read_later") return "starred";
+  if (filter && ["unread", "dismissed", "starred"].includes(filter)) return filter;
   return "unread";
 }

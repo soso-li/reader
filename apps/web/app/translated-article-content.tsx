@@ -24,7 +24,13 @@ type TranslatedArticleContentProps = {
   deferMs?: number;
   initialTranslation?: string;
   translationNeeded?: boolean;
+  /** 轮询间隔，仅测试注入；生产走默认值。 */
+  pollIntervalMs?: number;
 };
+
+// 翻译异步化（#106）：POST 返回 pending 时以同一请求轮询直至终态。
+const TRANSLATION_POLL_MS = 2000;
+const TRANSLATION_POLL_LIMIT = 150;
 
 export default function TranslatedArticleContent(props: TranslatedArticleContentProps) {
   return (
@@ -43,7 +49,8 @@ function TargetedTranslatedArticleContent({
   text,
   deferMs = 0,
   initialTranslation = "",
-  translationNeeded
+  translationNeeded,
+  pollIntervalMs = TRANSLATION_POLL_MS
 }: TranslatedArticleContentProps) {
   const shouldTranslate = translationNeeded !== false;
   const [translation, setTranslation] = useState<TranslationState | null>(() => !html?.trim() && initialTranslation.trim() ? readyTranslation(initialTranslation) : null);
@@ -51,15 +58,31 @@ function TargetedTranslatedArticleContent({
   const [error, setError] = useState("");
   const currentTarget = useRef(readingTarget(html, text));
   currentTarget.current = readingTarget(html, text);
+  const pollTimer = useRef<number | null>(null);
+  const requestController = useRef<AbortController | null>(null);
+
+  const clearPollTimer = useCallback(() => {
+    if (pollTimer.current === null) return;
+    window.clearTimeout(pollTimer.current);
+    pollTimer.current = null;
+  }, []);
+
+  const cancelTranslation = useCallback(() => {
+    clearPollTimer();
+    requestController.current?.abort();
+    requestController.current = null;
+  }, [clearPollTimer]);
 
   useEffect(() => {
+    cancelTranslation();
     setTranslation(!html?.trim() && initialTranslation.trim() ? readyTranslation(initialTranslation) : null);
     setLoading(false);
     setError("");
-  }, [html, initialTranslation, sourceId, text, translationNeeded]);
+    return cancelTranslation;
+  }, [apiUrl, cancelTranslation, html, initialTranslation, sourceId, text, translationNeeded]);
 
-  const requestTranslation = useCallback(() => {
-    if (!shouldTranslate || loading) return;
+  const performRequest = useCallback((retry: boolean, attempt: number) => {
+    if (!shouldTranslate) return;
     const requestedTarget = readingTarget(html, text);
     const blocks = html ? translationBlocksFromHtml(html) : [];
     if (html?.trim() && !blocks.length) {
@@ -70,10 +93,13 @@ function TargetedTranslatedArticleContent({
     setLoading(true);
     setError("");
     const controller = new AbortController();
+    requestController.current?.abort();
+    requestController.current = controller;
+    const payload = blocks.length ? { blocks, source_id: sourceId } : { text, source_id: sourceId };
     fetch(`${apiUrl.replace(/\/$/, "")}/translations`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(blocks.length ? { blocks, source_id: sourceId } : { text, source_id: sourceId }),
+      body: JSON.stringify(retry ? { ...payload, retry: true } : payload),
       signal: controller.signal
     })
       .then((response) => {
@@ -81,26 +107,50 @@ function TargetedTranslatedArticleContent({
         return response.json();
       })
       .then((data: TranslationState) => {
-        if (currentTarget.current === requestedTarget) setTranslation(data);
+        if (controller.signal.aborted || currentTarget.current !== requestedTarget) return;
+        if (data.status === "pending") {
+          if (attempt + 1 >= TRANSLATION_POLL_LIMIT) {
+            setError("翻译超时，请重试");
+            setLoading(false);
+            return;
+          }
+          clearPollTimer();
+          pollTimer.current = window.setTimeout(() => {
+            pollTimer.current = null;
+            performRequest(false, attempt + 1);
+          }, pollIntervalMs);
+          return;
+        }
+        if (data.status === "error") {
+          setError("翻译失败，请重试");
+          setLoading(false);
+          return;
+        }
+        setTranslation(data);
+        setLoading(false);
       })
       .catch((reason: Error) => {
         if (controller.signal.aborted || currentTarget.current !== requestedTarget) return;
         setError(reason.message || "翻译失败");
-      })
-      .finally(() => {
-        if (!controller.signal.aborted && currentTarget.current === requestedTarget) setLoading(false);
+        setLoading(false);
       });
-  }, [apiUrl, html, loading, shouldTranslate, sourceId, text]);
+  }, [apiUrl, clearPollTimer, html, pollIntervalMs, shouldTranslate, sourceId, text]);
+
+  const requestTranslation = useCallback(() => {
+    if (loading) return;
+    // 手动触发（含错误后的重试按钮）明确要求重新入队。
+    performRequest(Boolean(error), 0);
+  }, [error, loading, performRequest]);
 
   useEffect(() => {
     if (!shouldTranslate || translation || loading || error) return;
     if (deferMs <= 0) {
-      requestTranslation();
+      performRequest(false, 0);
       return;
     }
-    const timer = window.setTimeout(requestTranslation, deferMs);
+    const timer = window.setTimeout(() => performRequest(false, 0), deferMs);
     return () => window.clearTimeout(timer);
-  }, [deferMs, error, loading, requestTranslation, shouldTranslate, translation]);
+  }, [deferMs, error, loading, performRequest, shouldTranslate, translation]);
 
   if (!shouldTranslate || translation?.status === "skipped" || translation?.status === "empty") {
     return <ArticleContent bionic={bionic} html={html} text={text} />;

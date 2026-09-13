@@ -156,7 +156,6 @@ function clusterFixture(id, full) {
     last_seen_at: item.published_at,
     item_count: 1,
     read_status: "unread",
-    read_later: false,
     starred: false,
     items: [item],
     synthesis: null,
@@ -183,7 +182,6 @@ function browseFixture(id, full) {
     url: `https://source-${id}.example/${id}`,
     published_at: "2026-07-26T00:00:00Z",
     read_status: "unread",
-    read_later: false,
     starred: false,
     filtered: false,
     filter_rules: []

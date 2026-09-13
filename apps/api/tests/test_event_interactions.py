@@ -29,7 +29,7 @@ from reader_api.models import (
     TopicGroup,
     UserState,
 )
-from reader_api.projection_rebuild import inspect_projection_rebuild
+from reader_api.projection_rebuild import inspect_projection_rebuild, rebuild_projections
 from reader_api.report_generation import report_clusters
 from tests.factories import assign_publishable_cluster as assign_cluster, make_raw_entry
 
@@ -137,8 +137,8 @@ def create_event_fixture(
                         revision.id if read_status in {"summary_seen", "original_opened"} else None
                     ),
                     read_status=read_status,
-                    read_later=read_later,
-                    starred=starred,
+                    read_later=False,
+                    starred=starred or read_later,
                     updated_at=source_updated_at,
                 )
             )
@@ -175,6 +175,13 @@ def mutation_payload(
     if source_id is not None:
         payload["source_id"] = source_id
     return payload
+
+
+def test_public_api_exposes_only_the_unified_saved_contract() -> None:
+    response = TestClient(app).get("/openapi.json")
+
+    assert response.status_code == 200
+    assert "read_later" not in response.text
 
 
 def test_unread_cluster_cursor_survives_seen_rows_and_newer_arrivals() -> None:
@@ -314,7 +321,7 @@ def append_current_revision(
         return {"id": revision.id, "uid": revision.uid}
 
 
-def test_event_starred_and_read_later_are_revision_bound_atomic_and_idempotent() -> None:
+def test_event_saved_state_is_single_revision_bound_atomic_and_idempotent() -> None:
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     fixture = create_event_fixture()
@@ -335,7 +342,6 @@ def test_event_starred_and_read_later_are_revision_bound_atomic_and_idempotent()
         "observed_revision_uid": fixture["revision_uid"],
         "action": "starred_set",
         "value": True,
-        "read_later": False,
         "starred": True,
         "updated_at": first["updated_at"],
     }
@@ -344,15 +350,16 @@ def test_event_starred_and_read_later_are_revision_bound_atomic_and_idempotent()
     assert duplicate.status_code == 200
     assert duplicate.json() == first
 
-    read_later = mutation_payload(
+    legacy_read_later = mutation_payload(
         fixture,
         operation_id="22222222-2222-4222-8222-222222222222",
         action="read_later_set",
         value=True,
     )
-    later_response = client.post("/event-user-state", json=read_later)
+    later_response = client.post("/event-user-state", json=legacy_read_later)
     assert later_response.status_code == 200
-    assert later_response.json()["read_later"] is True
+    assert later_response.json()["action"] == "starred_set"
+    assert later_response.json()["starred"] is True
 
     SessionLocal = sessionmaker(bind=engine)
     with SessionLocal() as session:
@@ -364,10 +371,18 @@ def test_event_starred_and_read_later_are_revision_bound_atomic_and_idempotent()
         assert interactions[0].observed_revision_id == fixture["revision_id"]
         assert interactions[0].set_value is True
         assert interactions[0].payload["result"] == first
+        assert [interaction.action for interaction in interactions] == [
+            "starred_set",
+            "starred_set",
+        ]
+        assert all(
+            interaction.payload["saved_semantics"] == "unified"
+            for interaction in interactions
+        )
         event_state = session.scalar(select(EventUserState))
         assert event_state is not None
         assert event_state.starred is True
-        assert event_state.read_later is True
+        assert event_state.read_later is False
         assert session.scalar(
             select(func.count(UserState.id)).where(
                 UserState.object_type == "cluster"
@@ -378,7 +393,150 @@ def test_event_starred_and_read_later_are_revision_bound_atomic_and_idempotent()
         )
         assert metric is not None
         assert metric.starred_count == 1
-        assert metric.read_later_count == 1
+        assert metric.read_later_count == 0
+
+
+def test_legacy_saved_operation_retries_return_the_unified_result() -> None:
+    Base.metadata.drop_all(engine)
+    Base.metadata.create_all(engine)
+    fixture = create_event_fixture(suffix="legacy-retry")
+    occurred_at = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
+    with sessionmaker(bind=engine)() as session:
+        session.add_all(
+            [
+                InteractionEvent(
+                    operation_id="legacy-event-saved-retry",
+                    target_kind="event",
+                    event_id=int(fixture["event_id"]),
+                    observed_revision_id=int(fixture["revision_id"]),
+                    action="read_later_set",
+                    set_value=True,
+                    payload={
+                        "result": {
+                            "operation_id": "legacy-event-saved-retry",
+                            "event_uid": fixture["event_uid"],
+                            "observed_revision_uid": fixture["revision_uid"],
+                            "action": "read_later_set",
+                            "value": True,
+                            "read_later": True,
+                            "starred": False,
+                            "updated_at": occurred_at.isoformat(),
+                        }
+                    },
+                    occurred_at=occurred_at,
+                    recorded_at=occurred_at,
+                ),
+                InteractionEvent(
+                    operation_id="legacy-object-saved-retry",
+                    target_kind="legacy",
+                    object_type="item",
+                    object_id=int(fixture["item_id"]),
+                    action="read_later_set",
+                    set_value=True,
+                    payload={
+                        "result": {
+                            "object_type": "item",
+                            "object_id": fixture["item_id"],
+                            "read_status": "unread",
+                            "read_later": True,
+                            "starred": False,
+                        }
+                    },
+                    occurred_at=occurred_at,
+                    recorded_at=occurred_at,
+                ),
+                InteractionEvent(
+                    operation_id="legacy-event-star-retry",
+                    target_kind="event",
+                    event_id=int(fixture["event_id"]),
+                    observed_revision_id=int(fixture["revision_id"]),
+                    action="starred_set",
+                    set_value=False,
+                    payload={
+                        "result": {
+                            "operation_id": "legacy-event-star-retry",
+                            "event_uid": fixture["event_uid"],
+                            "observed_revision_uid": fixture["revision_uid"],
+                            "action": "starred_set",
+                            "value": False,
+                            "read_later": True,
+                            "starred": False,
+                            "updated_at": occurred_at.isoformat(),
+                        }
+                    },
+                    occurred_at=occurred_at,
+                    recorded_at=occurred_at,
+                ),
+                InteractionEvent(
+                    operation_id="legacy-object-star-retry",
+                    target_kind="legacy",
+                    object_type="item",
+                    object_id=int(fixture["item_id"]),
+                    action="starred_set",
+                    set_value=False,
+                    payload={
+                        "result": {
+                            "object_type": "item",
+                            "object_id": fixture["item_id"],
+                            "read_status": "unread",
+                            "read_later": True,
+                            "starred": False,
+                        }
+                    },
+                    occurred_at=occurred_at,
+                    recorded_at=occurred_at,
+                ),
+            ]
+        )
+        session.commit()
+
+    client = TestClient(app)
+    event_response = client.post(
+        "/event-user-state",
+        json=mutation_payload(
+            fixture,
+            operation_id="legacy-event-saved-retry",
+            action="read_later_set",
+            value=True,
+        ),
+    )
+    object_response = client.patch(
+        f"/user-state/item/{fixture['item_id']}",
+        json={
+            "operation_id": "legacy-object-saved-retry",
+            "read_later": True,
+        },
+    )
+    event_star_response = client.post(
+        "/event-user-state",
+        json=mutation_payload(
+            fixture,
+            operation_id="legacy-event-star-retry",
+            action="starred_set",
+            value=False,
+        ),
+    )
+    object_star_response = client.patch(
+        f"/user-state/item/{fixture['item_id']}",
+        json={
+            "operation_id": "legacy-object-star-retry",
+            "starred": False,
+        },
+    )
+
+    assert event_response.status_code == 200
+    assert event_response.json()["action"] == "starred_set"
+    assert event_response.json()["starred"] is True
+    assert "read_later" not in event_response.json()
+    assert object_response.status_code == 200
+    assert object_response.json()["starred"] is True
+    assert "read_later" not in object_response.json()
+    assert event_star_response.status_code == 200
+    assert event_star_response.json()["starred"] is True
+    assert "read_later" not in event_star_response.json()
+    assert object_star_response.status_code == 200
+    assert object_star_response.json()["starred"] is True
+    assert "read_later" not in object_star_response.json()
 
 
 def test_event_mutation_rejects_missing_unknown_wrong_or_reused_identity() -> None:
@@ -411,11 +569,11 @@ def test_event_mutation_rejects_missing_unknown_wrong_or_reused_identity() -> No
     assert client.post("/event-user-state", json=wrong_owner).status_code == 409
 
     unknown_action = dict(valid, action="toggle_starred")
-    assert client.post("/event-user-state", json=unknown_action).status_code == 400
+    assert client.post("/event-user-state", json=unknown_action).status_code == 422
 
     assert client.post("/event-user-state", json=valid).status_code == 200
     reused = dict(valid, action="read_later_set")
-    assert client.post("/event-user-state", json=reused).status_code == 409
+    assert client.post("/event-user-state", json=reused).status_code == 200
 
     cluster_id = int(first["cluster_id"])
     bypass = client.patch(
@@ -432,13 +590,22 @@ def test_event_mutation_rejects_missing_unknown_wrong_or_reused_identity() -> No
     )
 
 
-def test_baseline_nondefault_state_keeps_original_retry_result_and_metric_floor() -> None:
+def test_baseline_saved_intent_can_be_cleared_and_restored_after_unification() -> None:
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     fixture = create_event_fixture(
         suffix="baseline",
         baseline=("summary_seen", True, True),
     )
+    with sessionmaker(bind=engine)() as session:
+        session.add(
+            FeedMetric(
+                source_id=int(fixture["source_id"]),
+                starred_count=1,
+                read_later_count=0,
+            )
+        )
+        session.commit()
     client = TestClient(app)
     clear_star = mutation_payload(
         fixture,
@@ -448,7 +615,6 @@ def test_baseline_nondefault_state_keeps_original_retry_result_and_metric_floor(
     )
     original = client.post("/event-user-state", json=clear_star).json()
     assert original["starred"] is False
-    assert original["read_later"] is True
 
     restore_star = mutation_payload(
         fixture,
@@ -465,9 +631,87 @@ def test_baseline_nondefault_state_keeps_original_retry_result_and_metric_floor(
         state = session.scalar(select(EventUserState))
         assert state is not None
         assert state.starred is True
+        assert state.read_later is False
         metric = session.scalar(select(FeedMetric))
         assert metric is not None
         assert metric.starred_count == 1
+        assert metric.read_later_count == 0
+
+
+def test_projection_rebuild_preserves_legacy_read_later_history_without_reviving_it() -> None:
+    Base.metadata.drop_all(engine)
+    Base.metadata.create_all(engine)
+    fixture = create_event_fixture(
+        suffix="saved-rebuild",
+        baseline=("unread", True, False),
+    )
+    legacy_at = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
+    SessionLocal = sessionmaker(bind=engine)
+    with SessionLocal() as session:
+        session.add(
+            InteractionEvent(
+                operation_id="legacy-read-later-before-unification",
+                target_kind="event",
+                event_id=int(fixture["event_id"]),
+                observed_revision_id=int(fixture["revision_id"]),
+                action="read_later_set",
+                set_value=True,
+                payload={"metric_source_ids": [int(fixture["source_id"])]},
+                occurred_at=legacy_at,
+                recorded_at=legacy_at,
+            )
+        )
+        session.add(
+            FeedMetric(
+                source_id=int(fixture["source_id"]),
+                starred_count=1,
+                read_later_count=0,
+            )
+        )
+        session.commit()
+
+    response = TestClient(app).post(
+        "/event-user-state",
+        json=mutation_payload(
+            fixture,
+            operation_id="unified-saved-cancel",
+            action="starred_set",
+            value=False,
+        ),
+    )
+    assert response.status_code == 200
+    assert response.json()["starred"] is False
+
+    with SessionLocal() as session:
+        state = session.scalar(select(EventUserState))
+        metric = session.scalar(select(FeedMetric))
+        assert state is not None
+        assert metric is not None
+        state.starred = True
+        metric.starred_count = 7
+        session.commit()
+
+    with SessionLocal() as session:
+        result = rebuild_projections(session)
+        session.commit()
+        assert result["matches"] is True
+        state = session.scalar(select(EventUserState))
+        metric = session.scalar(select(FeedMetric))
+        assert state is not None
+        assert state.starred is False
+        assert state.read_later is False
+        assert metric is not None
+        assert metric.starred_count == 0
+        assert metric.read_later_count == 0
+        assert [
+            interaction.action
+            for interaction in session.scalars(
+                select(InteractionEvent).order_by(
+                    InteractionEvent.recorded_at,
+                    InteractionEvent.id,
+                )
+            )
+        ] == ["read_later_set", "starred_set"]
 
 
 def test_baseline_summary_seen_first_original_open_only_adds_opened_metric() -> None:
@@ -704,7 +948,7 @@ def test_item_report_and_topic_actions_append_honest_object_interactions() -> No
                 field="read_later",
                 value=True,
             ),
-            "read_later_set",
+            "starred_set",
             True,
         ),
         (
@@ -750,6 +994,9 @@ def test_item_report_and_topic_actions_append_honest_object_interactions() -> No
                 fixture["source_id"] if object_type == "item" else None
             )
             assert interaction.payload["result"] == response
+            assert "read_later" not in response
+            if action_name == "starred_set":
+                assert interaction.payload["saved_semantics"] == "unified"
         metric = session.scalar(
             select(FeedMetric).where(
                 FeedMetric.source_id == fixture["source_id"]
@@ -759,9 +1006,10 @@ def test_item_report_and_topic_actions_append_honest_object_interactions() -> No
         assert metric.read_count == 0
         assert metric.opened_count == 0
         assert metric.starred_count == 1
+        assert metric.read_later_count == 0
 
 
-def test_object_interaction_operation_is_idempotent_and_cannot_change_meaning() -> None:
+def test_legacy_object_read_later_write_is_normalized_and_idempotent() -> None:
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     fixture = create_event_fixture(suffix="object-idempotent")
@@ -782,6 +1030,8 @@ def test_object_interaction_operation_is_idempotent_and_cannot_change_meaning() 
     assert first.status_code == 200
     assert duplicate.status_code == 200
     assert duplicate.json() == first.json()
+    assert first.json()["starred"] is True
+    assert "read_later" not in first.json()
     assert (
         client.patch(
             f"/user-state/item/{fixture['item_id']}",
@@ -799,9 +1049,14 @@ def test_object_interaction_operation_is_idempotent_and_cannot_change_meaning() 
     SessionLocal = sessionmaker(bind=engine)
     with SessionLocal() as session:
         assert session.scalar(select(func.count(InteractionEvent.id))) == 1
+        interaction = session.scalar(select(InteractionEvent))
+        assert interaction is not None
+        assert interaction.action == "starred_set"
+        assert interaction.payload["saved_semantics"] == "unified"
         metric = session.scalar(select(FeedMetric))
         assert metric is not None
-        assert metric.read_later_count == 1
+        assert metric.starred_count == 1
+        assert metric.read_later_count == 0
 
 
 def test_object_interactions_require_one_explicit_operation_and_real_target() -> None:
@@ -847,7 +1102,7 @@ def test_object_interactions_require_one_explicit_operation_and_real_target() ->
                 "read_later": True,
             },
         ).status_code
-        == 400
+        == 422
     )
 
     SessionLocal = sessionmaker(bind=engine)
@@ -1195,6 +1450,15 @@ def test_uninterested_event_is_recoverable_reasoned_and_yields_to_rules() -> Non
         suffix="uninterested",
         baseline=("unread", True, True),
     )
+    with sessionmaker(bind=engine)() as session:
+        session.add(
+            FeedMetric(
+                source_id=int(fixture["source_id"]),
+                starred_count=1,
+                read_later_count=0,
+            )
+        )
+        session.commit()
     client = TestClient(app)
     initial = client.post(
         "/uninterested",
@@ -1242,8 +1506,8 @@ def test_uninterested_event_is_recoverable_reasoned_and_yields_to_rules() -> Non
     assert direct["uninterested"] is True
     event_detail = client.get(f"/clusters/{fixture['cluster_id']}").json()
     assert event_detail["read_status"] == "unread"
-    assert event_detail["read_later"] is True
     assert event_detail["starred"] is True
+    assert "read_later" not in event_detail
     bucket = client.get("/uninterested-targets").json()
     assert bucket["count"] == 1
     assert bucket["items"][0]["target_kind"] == "event"
@@ -1365,12 +1629,13 @@ def test_uninterested_event_is_recoverable_reasoned_and_yields_to_rules() -> Non
     assert client.get("/uninterested-targets").json()["count"] == 0
     visible = client.get(f"/clusters/{fixture['cluster_id']}").json()
     assert {
-        key: visible[key] for key in ("read_status", "read_later", "starred")
-    } == {"read_status": "unread", "read_later": True, "starred": True}
+        key: visible[key] for key in ("read_status", "starred")
+    } == {"read_status": "unread", "starred": True}
+    assert "read_later" not in visible
     with sessionmaker(bind=engine)() as session:
         report = inspect_projection_rebuild(session)
-        assert report["matches"] is True
-        assert session.scalar(select(func.count(FeedMetric.id))) == 0
+        assert report["matches"] is True, report
+        assert session.scalar(select(func.count(FeedMetric.id))) == 1
 
 
 def test_uninterested_article_without_an_event_moves_only_itself() -> None:

@@ -214,7 +214,7 @@ export default function FilterRuleManager({
       <div className="filter-rule-heading">
         <div>
           <h3>关键词过滤</h3>
-          <p className="source-meta">命中原始标题、RSS 摘要或原始正文的条目会退出自动流；搜索、收藏、稍后读和“已过滤”列表仍可排查。</p>
+          <p className="source-meta">命中原始标题、RSS 摘要或原始正文的条目会退出自动流；搜索、收藏和“已过滤”列表仍可排查。</p>
         </div>
         <button className="action-link" type="button" onClick={() => openCreate()}><Plus size={14} /> 新建规则</button>
       </div>

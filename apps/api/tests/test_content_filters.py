@@ -77,7 +77,7 @@ def _seed_items() -> tuple[int, list[int]]:
                 object_type="item",
                 object_id=item_ids[1],
                 read_status="summary_seen",
-                read_later=True,
+                read_later=False,
                 starred=True,
             )
         )
@@ -122,16 +122,17 @@ def test_filter_rule_preview_apply_pause_edit_and_delete_preserve_user_state() -
     assert filtered["count"] == 2
     assert len(filtered["items"]) == 2
     source_summary = next(row for row in client.get("/sources").json() if row["id"] == source_id)
-    assert source_summary["unread_count"] == 3
+    assert source_summary["unread_count"] == 1
+    assert source_summary["folder_unread_count"] == 1
     assert source_summary["all_unread_count"] == 1
 
     after_state = client.get(f"/items/{item_ids[1]}").json()
     assert {
         key: after_state[key]
-        for key in ("read_status", "read_later", "starred")
+        for key in ("read_status", "starred")
     } == {
         key: before_state[key]
-        for key in ("read_status", "read_later", "starred")
+        for key in ("read_status", "starred")
     }
 
     paused = client.patch(f"/filter-rules/{rule['id']}", json={"enabled": False})

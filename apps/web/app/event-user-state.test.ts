@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { NextRequest } from "next/server.js";
+
+import { PATCH as patchLegacyObjectState } from "./actions/client-user-state/route.ts";
+import { POST as postLegacyEventState } from "./actions/event-user-state/route.ts";
+import { POST as postLegacyObjectStateForm } from "./actions/user-state/route.ts";
 
 import {
   createOperationId,
@@ -51,6 +56,100 @@ const identity = {
   event_uid: "11111111-1111-4111-8111-111111111111",
   current_revision_uid: "22222222-2222-4222-8222-222222222222"
 };
+
+test("server action boundaries normalize legacy saved requests", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    requests.push({
+      url: String(input),
+      body: JSON.parse(String(init?.body)) as Record<string, unknown>
+    });
+    return Response.json({ ok: true });
+  }) as typeof fetch;
+
+  try {
+    const objectResponse = await patchLegacyObjectState(new NextRequest(
+      "http://reader.test/actions/client-user-state",
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          object_type: "item",
+          object_id: 42,
+          operation_id: "11111111-aaaa-4111-8111-111111111111",
+          read_later: true
+        })
+      }
+    ));
+    const eventResponse = await postLegacyEventState(new NextRequest(
+      "http://reader.test/actions/event-user-state",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          event_uid: identity.event_uid,
+          observed_revision_uid: identity.current_revision_uid,
+          operation_id: "22222222-bbbb-4222-8222-222222222222",
+          action: "read_later_set",
+          value: false
+        })
+      }
+    ));
+    const formResponse = await postLegacyObjectStateForm(new NextRequest(
+      "http://reader.test/actions/user-state",
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          referer: "http://reader.test/?view=reports"
+        },
+        body: new URLSearchParams({
+          object_type: "report",
+          object_id: "20260823",
+          operation_id: "33333333-cccc-4333-8333-333333333333",
+          read_later: "true"
+        })
+      }
+    ));
+
+    assert.equal(objectResponse.status, 200);
+    assert.equal(eventResponse.status, 200);
+    assert.equal(formResponse.status, 303);
+    assert.deepEqual(requests.map(({ body }) => body), [
+      {
+        operation_id: "11111111-aaaa-4111-8111-111111111111",
+        starred: true
+      },
+      {
+        event_uid: identity.event_uid,
+        observed_revision_uid: identity.current_revision_uid,
+        operation_id: "22222222-bbbb-4222-8222-222222222222",
+        action: "starred_set",
+        value: false
+      },
+      {
+        operation_id: "33333333-cccc-4333-8333-333333333333",
+        starred: true
+      }
+    ]);
+
+    const conflict = await patchLegacyObjectState(new NextRequest(
+      "http://reader.test/actions/client-user-state",
+      {
+        method: "PATCH",
+        body: JSON.stringify({
+          object_type: "item",
+          object_id: 42,
+          starred: true,
+          read_later: false
+        })
+      }
+    ));
+    assert.equal(conflict.status, 400);
+    assert.equal(requests.length, 3);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test("bulk read keeps only the opaque server batch before confirmation", () => {
   const prepared = {
@@ -161,7 +260,7 @@ test("creates one explicit object set mutation with a caller-owned operation", (
           object_type: "report",
           object_id: 20260714,
           starred: true,
-          read_later: true
+          read_status: "summary_seen"
         },
         "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
       ),
@@ -198,7 +297,7 @@ test("object beacon fallback reuses the exact operation body", async () => {
       object_id: 7,
       operation_id: "cccccccc-3333-4333-8333-cccccccccccc",
       read_status: "summary_seen"
-    });
+    }, { beacon: true });
     assert.equal(bodies.length, 1);
     assert.deepEqual(JSON.parse(bodies[0]), {
       object_type: "topic",
@@ -331,7 +430,7 @@ test("API client preserves an upstream business error status", async () => {
   }
 });
 
-test("object sendBeacon accepts the caller operation without a fetch", async () => {
+test("explicit object sendBeacon accepts the caller operation without a fetch", async () => {
   const originalNavigator = globalThis.navigator;
   const originalFetch = globalThis.fetch;
   const beaconBodies: Blob[] = [];
@@ -357,13 +456,51 @@ test("object sendBeacon accepts the caller operation without a fetch", async () 
       object_id: 20260714,
       operation_id: "abababab-7777-4777-8777-abababababab",
       read_status: "summary_seen"
-    });
+    }, { beacon: true });
     assert.equal(fetchCalls, 0);
     assert.equal(beaconBodies.length, 1);
     assert.equal(
       JSON.parse(await beaconBodies[0].text()).operation_id,
       "abababab-7777-4777-8777-abababababab"
     );
+  } finally {
+    Object.defineProperty(globalThis, "navigator", {
+      configurable: true,
+      value: originalNavigator
+    });
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("default object writes report server failure even when beacon would accept them", async () => {
+  const originalNavigator = globalThis.navigator;
+  const originalFetch = globalThis.fetch;
+  const bodies: string[] = [];
+  let beaconCalls = 0;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { sendBeacon: () => { beaconCalls += 1; return true; } }
+  });
+  globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+    bodies.push(String(init?.body));
+    assert.equal(init?.keepalive, true);
+    return Response.json({ error: "service unavailable" }, { status: 503 });
+  }) as typeof fetch;
+
+  try {
+    await assert.rejects(
+      sendClientUserState({
+        object_type: "item",
+        object_id: 42,
+        operation_id: "edededed-8888-4888-8888-edededededed",
+        starred: true
+      }),
+      /阅读状态更新失败/
+    );
+    assert.equal(beaconCalls, 0);
+    assert.equal(bodies.length, 2);
+    assert.equal(new Set(bodies).size, 1);
+    assert.equal(JSON.parse(bodies[0]).operation_id, "edededed-8888-4888-8888-edededededed");
   } finally {
     Object.defineProperty(globalThis, "navigator", {
       configurable: true,
@@ -973,7 +1110,6 @@ test("confirms only the field owned by each operation result", () => {
     operation_id: "66666666-6666-4666-8666-666666666666",
     value: true,
     read_status: "unread",
-    read_later: false,
     starred: true,
     seen_revision_uid: null,
     current_revision_differs_from_seen: true,
@@ -985,14 +1121,6 @@ test("confirms only the field owned by each operation result", () => {
   assert.deepEqual(
     confirmedEventStatePatch({ ...baseResult, action: "starred_set" }),
     { starred: true }
-  );
-  assert.deepEqual(
-    confirmedEventStatePatch({
-      ...baseResult,
-      action: "read_later_set",
-      read_later: true
-    }),
-    { read_later: true }
   );
   assert.deepEqual(
     confirmedEventStatePatch({
@@ -1036,7 +1164,7 @@ test("fetch retry reuses the exact operation body", async () => {
       event_uid: identity.event_uid,
       observed_revision_uid: identity.current_revision_uid,
       operation_id: "44444444-4444-4444-8444-444444444444",
-      action: "read_later_set",
+      action: "starred_set",
       value: true
     };
     await sendEventUserStateMutation(mutation, { beacon: false });

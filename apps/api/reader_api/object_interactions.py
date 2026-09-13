@@ -24,7 +24,6 @@ from .schemas import UserStateOut, UserStatePatch
 
 OBJECT_ACTION_FIELDS = {
     "read_status": "read_status_set",
-    "read_later": "read_later_set",
     "starred": "starred_set",
 }
 OBJECT_STATE_TYPES = {"item", "report", "topic"}
@@ -36,6 +35,8 @@ def apply_object_user_state_mutation(
     object_type: str,
     object_id: int,
     mutation: UserStatePatch,
+    *,
+    require_non_article: bool = False,
 ) -> UserStateOut:
     if object_type not in OBJECT_STATE_TYPES:
         raise HTTPException(status_code=400, detail="不支持的对象状态类型")
@@ -69,6 +70,13 @@ def apply_object_user_state_mutation(
 
     source_id = lock_object_target(session, object_type, object_id)
     locked_metric = lock_object_metric(session, source_id)
+    if require_non_article:
+        if locked_metric is None:
+            raise HTTPException(status_code=404, detail="条目不存在")
+        # The preflight may have cached Source before another writer changed it.
+        session.refresh(locked_metric[0], attribute_names=["media_type", "status"])
+        if locked_metric[0].media_type == "article" or locked_metric[0].status == DELETED_SOURCE_STATUS:
+            raise HTTPException(status_code=409, detail="条目类型已变化，请刷新")
     item = lock_item_after_source(session, object_id, source_id)
     state = session.scalar(
         select(UserState)
@@ -83,11 +91,12 @@ def apply_object_user_state_mutation(
         session.add(state)
         session.flush()
 
-    previous = (state.read_status, state.read_later, state.starred)
+    previous = (state.read_status, bool(state.starred or state.read_later))
     if field == "read_status":
         state.read_status = next_read_status(state.read_status, str(value))
     else:
-        setattr(state, field, bool(value))
+        state.starred = bool(value)
+        state.read_later = False
     occurred_at = now_utc()
     state.updated_at = occurred_at
 
@@ -115,9 +124,9 @@ def apply_object_user_state_mutation(
         payload={
             "previous": {
                 "read_status": previous[0],
-                "read_later": previous[1],
-                "starred": previous[2],
+                "starred": previous[1],
             },
+            **({"saved_semantics": "unified"} if field == "starred" else {}),
             "metric_source_id": item.source_id if item is not None else None,
             "metric_delta": metric_delta,
             "result": result_payload,
@@ -203,11 +212,14 @@ def original_object_operation_result(
     action: str,
     value: object,
 ) -> UserStateOut:
+    action_matches = existing.action == action or (
+        existing.action == "read_later_set" and action == "starred_set"
+    )
     matches = (
         existing.target_kind == STORED_OBJECT_TARGET_KIND
         and existing.object_type == object_type
         and existing.object_id == object_id
-        and existing.action == action
+        and action_matches
         and existing.set_value == value
     )
     if not matches:
@@ -216,4 +228,10 @@ def original_object_operation_result(
     result = payload.get("result")
     if not isinstance(result, dict):
         raise RuntimeError("Interaction Event 缺少原操作结果")
+    if "read_later" in result:
+        result = {
+            **result,
+            "starred": bool(result.get("starred") or result.get("read_later")),
+        }
+        result.pop("read_later", None)
     return UserStateOut.model_validate(result)

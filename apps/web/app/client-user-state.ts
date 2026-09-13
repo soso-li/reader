@@ -8,7 +8,6 @@ export type ClientUserStatePatch = {
   object_id: number;
   operation_id?: string;
   read_status?: string;
-  read_later?: boolean;
   starred?: boolean;
 };
 
@@ -20,7 +19,7 @@ export function createObjectUserStateMutation(
   patch: ClientUserStatePatch,
   operationId = createOperationId()
 ): ObjectUserStateMutation {
-  const fields = [patch.read_status, patch.read_later, patch.starred].filter(
+  const fields = [patch.read_status, patch.starred].filter(
     (value) => value !== undefined
   );
   if (fields.length !== 1) {
@@ -35,7 +34,7 @@ export async function sendClientUserState(patch: ClientUserStatePatch, options: 
     patch.operation_id ?? createOperationId()
   );
   const body = JSON.stringify(mutation);
-  if (options.beacon !== false && navigator.sendBeacon?.("/actions/client-user-state", new Blob([body], { type: "application/json" }))) {
+  if (options.beacon === true && navigator.sendBeacon?.("/actions/client-user-state", new Blob([body], { type: "application/json" }))) {
     return;
   }
 

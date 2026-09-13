@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Literal
 import json
 import os
 import re
@@ -24,7 +25,7 @@ from redis import Redis
 from rq import Queue
 from rq.exceptions import NoSuchJobError
 from rq.registry import StartedJobRegistry
-from sqlalchemy import and_, case, delete, false, func, literal, or_, select, text
+from sqlalchemy import and_, case, delete, false, func, literal, or_, select, text, update
 from sqlalchemy.orm import Load, Session, aliased, joinedload, undefer
 from starlette.background import BackgroundTask
 
@@ -41,8 +42,10 @@ from .ai_runtime import (
     translation_settings_for_source,
     valid_model_base_url,
     validate_synthesis_remote_settings,
+    validate_translation_profile,
 )
 from .bulk_read import (
+    apply_event_read_marks,
     confirm_bulk_read_batch,
     prepare_bulk_read_manifest,
     store_bulk_read_manifest,
@@ -96,6 +99,16 @@ from .event_projection import (
     cluster_current_event_state_projection,
     cluster_event_identities_for,
     event_material_updates_for,
+)
+from .event_stream import (
+    READ_STATUSES,
+    StreamSearch,
+    cluster_effective_state_expressions,
+    cluster_stream_list_query,
+    cluster_stream_query,
+    cluster_stream_unread_page_rows,
+    include_filtered_for_scope,
+    unread_event_stream_membership,
 )
 from .event_interactions import apply_event_user_state_mutation
 from .event_synthesis import (
@@ -255,9 +268,10 @@ from .uninterested import (
     ordinary_content_clause,
     uninterested_feedback_for_items,
 )
-from .worker import begin_fetch_refresh, enqueue_source_fetch_job, fetch_refresh_status, wip_job_ids
+from .worker import enqueue_translation_job, translation_job_is_active, begin_fetch_refresh, enqueue_source_fetch_job, fetch_refresh_status, wip_job_ids
 from . import translations as translation_utils
 from .schemas import (
+    EventReadBatchIn, EventReadBatchOut,
     AIChatIn,
     AIChatOut,
     AISettingsPatch,
@@ -344,7 +358,7 @@ SOURCE_STATUSES = {"active", "trial", "muted", "archived"}
 SOURCE_MEDIA_TYPE_ORDER = list(SOURCE_MEDIA_TYPES)
 APP_TIMEZONE = timezone(timedelta(hours=8))
 FAVICON_SUCCESS_TTL_SECONDS = 7 * 24 * 60 * 60
-FAVICON_FAILURE_TTL_SECONDS = 10 * 60
+FAVICON_FAILURE_TTL_SECONDS = 24 * 60 * 60
 FAVICON_MAX_BYTES = 512 * 1024
 MAX_OPML_BYTES = 2 * 1024 * 1024
 MAX_OPML_REQUEST_BYTES = MAX_OPML_BYTES + 64 * 1024
@@ -501,7 +515,11 @@ def _article_image(
     x_reader_image_source: str | None,
 ) -> Response:
     if not valid_cache_key(cache_key):
-        raise HTTPException(status_code=404, detail="图片缓存键无效")
+        raise HTTPException(
+            status_code=404,
+            detail="图片缓存键无效",
+            headers=IMAGE_ERROR_CACHE_HEADERS,
+        )
     try:
         cache = configured_article_image_cache()
         cached = cache.read(cache_key)
@@ -521,9 +539,17 @@ def _article_image(
             registered_url = ""
         url = registered_url or (x_reader_image_source or src).strip()
         if not url or cache_key_for_url(url) != cache_key:
-            raise HTTPException(status_code=404, detail="图片来源不可用")
+            raise HTTPException(
+                status_code=404,
+                detail="图片来源不可用",
+                headers=IMAGE_ERROR_CACHE_HEADERS,
+            )
         if cache.proxy_attempted(cache_key):
-            raise HTTPException(status_code=502, detail="图片回源失败")
+            raise HTTPException(
+                status_code=502,
+                detail="图片回源失败",
+                headers=IMAGE_ERROR_CACHE_HEADERS,
+            )
         try:
             cache.register(url)
         except OSError:
@@ -538,7 +564,11 @@ def _article_image(
                 cache.mark_proxy_attempted(url)
             except OSError:
                 pass
-            raise HTTPException(status_code=502, detail="图片回源失败")
+            raise HTTPException(
+                status_code=502,
+                detail="图片回源失败",
+                headers=IMAGE_ERROR_CACHE_HEADERS,
+            )
         try:
             cache.store(url, image)
             eviction = BackgroundTask(cache.evict)
@@ -1170,77 +1200,19 @@ def delete_folder(folder_id: int, session: Session = Depends(get_session)) -> Re
     return Response(status_code=204)
 
 
-def cluster_effective_state_expressions(session: Session):
-    current_event_state = cluster_current_event_state_projection(session)
-    effective_read_status = case(
-        (
-            current_event_state.c.material_update_revision_uid.is_not(None),
-            "unread",
-        ),
-        else_=func.coalesce(current_event_state.c.read_status, "unread"),
-    )
-    effective_read_later = func.coalesce(current_event_state.c.read_later, false())
-    effective_starred = func.coalesce(current_event_state.c.starred, false())
-    return (
-        current_event_state,
-        effective_read_status,
-        effective_read_later,
-        effective_starred,
-    )
-
-
 @app.get("/sources", response_model=list[SourceOut])
 def list_sources(
     include_metrics: bool = True,
     session: Session = Depends(get_session),
 ) -> list[SourceOut]:
-    (
-        current_event_state,
-        effective_read_status,
-        _effective_read_later,
-        _effective_starred,
-    ) = cluster_effective_state_expressions(session)
-    unread_cluster_clause = effective_read_status == "unread"
-    unread_membership = (
-        select(
-            ClusterItem.cluster_id.label("cluster_id"),
-            ContentItem.source_id.label("source_id"),
-            Source.folder_id.label("folder_id"),
-            Source.media_type.label("media_type"),
-        )
-        .join(ClusterItem, ClusterItem.content_item_id == ContentItem.id)
-        .join(Source, Source.id == ContentItem.source_id)
-        .join(current_event_state, current_event_state.c.cluster_id == ClusterItem.cluster_id, isouter=True)
-        .where(
-            Source.status == "active",
-            unread_cluster_clause,
-            func.coalesce(current_event_state.c.uninterested, false()).is_(False),
-            unfiltered_content_clause(ContentItem.id),
-            ordinary_content_clause(session, ContentItem.id),
-        )
-        .distinct()
-        .cte("unread_membership")
-    )
+    unread_membership = unread_event_stream_membership(session)
     article_unread_source_counts = (
         select(
-            ContentItem.source_id.label("source_id"),
-            func.count(func.distinct(ClusterItem.cluster_id)).label("unread_count"),
+            unread_membership.c.source_id.label("source_id"),
+            func.count(func.distinct(unread_membership.c.cluster_id)).label("unread_count"),
         )
-        .join(ClusterItem, ClusterItem.content_item_id == ContentItem.id)
-        .join(Source, Source.id == ContentItem.source_id)
-        .join(
-            current_event_state,
-            current_event_state.c.cluster_id == ClusterItem.cluster_id,
-            isouter=True,
-        )
-        .where(
-            Source.status == "active",
-            Source.media_type == "article",
-            unread_cluster_clause,
-            func.coalesce(current_event_state.c.uninterested, false()).is_(False),
-            ordinary_content_clause(session, ContentItem.id),
-        )
-        .group_by(ContentItem.source_id)
+        .where(unread_membership.c.media_type == "article")
+        .group_by(unread_membership.c.source_id)
     )
     media_unread_source_counts = (
         select(
@@ -1258,6 +1230,7 @@ def list_sources(
             Source.status == "active",
             Source.media_type != "article",
             or_(UserState.id.is_(None), UserState.read_status == "unread"),
+            unfiltered_content_clause(ContentItem.id),
             ordinary_content_clause(session, ContentItem.id),
         )
         .group_by(ContentItem.source_id)
@@ -2403,14 +2376,19 @@ def list_items(
     media_type: str | None = None,
     q: str | None = None,
     read_status: str | None = None,
-    read_later: bool | None = None,
     starred: bool | None = None,
     limit: int = 80,
     offset: int = 0,
+    cursor_id: int | None = None,
+    cursor_published_at: datetime | Literal["null"] | None = None,
     include_content: bool = True,
     filtered_only: bool = False,
     session: Session = Depends(get_session),
 ) -> list[ItemOut]:
+    if cursor_id is not None and (offset or filtered_only):
+        raise HTTPException(status_code=400, detail="条目游标不能与偏移量或已过滤列表同时使用")
+    if cursor_published_at is not None and cursor_id is None:
+        raise HTTPException(status_code=400, detail="分页时间必须与条目游标同时使用")
     if filtered_only:
         return query_filtered_items(
             session,
@@ -2429,10 +2407,11 @@ def list_items(
         media_type=media_type,
         q=q,
         read_status=read_status,
-        read_later=read_later,
         starred=starred,
         limit=limit,
         offset=offset,
+        cursor_id=cursor_id,
+        cursor_published_at=cursor_published_at,
         include_content=include_content,
     )
 
@@ -2530,7 +2509,6 @@ def search(
     source_id: int | None = None,
     media_type: str | None = None,
     read_status: str | None = None,
-    read_later: bool | None = None,
     starred: bool | None = None,
     limit: int = 80,
     offset: int = 0,
@@ -2544,7 +2522,6 @@ def search(
         media_type=media_type,
         q=q,
         read_status=read_status,
-        read_later=read_later,
         starred=starred,
         limit=limit,
         offset=offset,
@@ -2585,6 +2562,25 @@ def post_event_user_state(
     except Exception:
         session.rollback()
         raise
+
+
+@app.post(
+    "/event-user-state/batch",
+    response_model=EventReadBatchOut,
+    response_model_exclude_unset=True,
+)
+def post_event_user_state_batch(
+    payload: EventReadBatchIn,
+    session: Session = Depends(get_session),
+) -> EventReadBatchOut:
+    try:
+        results = apply_event_read_marks(session, payload.marks)
+        session.commit()
+        return EventReadBatchOut(results=results)
+    except Exception:
+        session.rollback()
+        raise
+
 
 
 @app.post("/uninterested", response_model=UninterestedMutationOut)
@@ -3332,6 +3328,7 @@ def get_event_revision(
         .join(Source, Source.id == EventEvidenceVersion.source_id)
         .where(EventRevisionEvidence.revision_id == revision.id)
         .order_by(EventRevisionEvidence.id)
+        .options(undefer(EventEvidenceVersion.reading_html_snapshot))
     ).all()
     reading_documents = event_evidence_reading_documents(
         session, [version for _link, version, _evidence, _source in evidence_rows]
@@ -3367,9 +3364,13 @@ def get_event_revision(
                 published_at=version.published_at_snapshot,
                 content=version.content_snapshot,
                 reading_html=(
-                    reading_documents[version.id].reading_html
-                    if reading_documents[version.id] is not None
-                    else None
+                    version.reading_html_snapshot
+                    if version.reading_html_snapshot is not None
+                    else (
+                        reading_documents[version.id].reading_html
+                        if reading_documents[version.id] is not None
+                        else None
+                    )
                 ),
                 body_source=(
                     reading_documents[version.id].body_source
@@ -3422,7 +3423,6 @@ def event_evidence_reading_documents(
             else None
         )
     return matches
-
 
 def event_revision_summary(revision: EventRevision) -> EventRevisionSummaryOut:
     return EventRevisionSummaryOut(
@@ -3495,7 +3495,6 @@ def event_read_out(session: Session, event: Event) -> EventReadOut:
         material_update_revision_uid=material_update_revision_uid,
         user_state=EventUserStateReadOut(
             read_status=state.read_status if state else "unread",
-            read_later=bool(state and state.read_later),
             starred=bool(state and state.starred),
             uninterested=bool(state and state.uninterested),
             uninterested_reason=state.uninterested_reason if state else None,
@@ -3633,7 +3632,6 @@ def list_clusters(
     source_id: int | None = None,
     q: str | None = None,
     read_status: str | None = None,
-    read_later: bool | None = None,
     starred: bool | None = None,
     limit: int = 80,
     offset: int = 0,
@@ -3648,79 +3646,38 @@ def list_clusters(
     cursor = session.get(Cluster, cursor_id) if cursor_id is not None else None
     if cursor_id is not None and cursor is None:
         raise HTTPException(status_code=400, detail="分页游标不存在")
-    (
-        current_event_state,
-        effective_read_status,
-        effective_read_later,
-        effective_starred,
-    ) = cluster_effective_state_expressions(session)
-    stmt = (
-        select(Cluster, func.count(ClusterItem.id))
-        .join(ClusterItem, ClusterItem.cluster_id == Cluster.id)
-        .join(ContentItem, ContentItem.id == ClusterItem.content_item_id)
-        .join(Source, Source.id == ContentItem.source_id)
-        .join(current_event_state, current_event_state.c.cluster_id == Cluster.id, isouter=True)
-        .where(
-            Source.status == "active",
-            Source.media_type == "article",
-            func.coalesce(current_event_state.c.uninterested, false()).is_(False),
-            ordinary_content_clause(session, ContentItem.id),
+    if (
+        read_status == "unread"
+        and starred is None
+        and folder_id is None
+        and source_id is None
+        and not q
+        and order == "desc"
+        and not offset
+    ):
+        rows = cluster_stream_unread_page_rows(
+            session,
+            search=STREAM_SEARCH,
+            cursor=cursor,
+            limit=min(max(limit, 1), 200),
         )
-    )
-    active_lookup = source_id is not None or bool(q) or read_later is not None or starred is not None
-    if not active_lookup:
-        stmt = stmt.where(unfiltered_content_clause(ContentItem.id))
-    if read_status:
-        if read_status not in READ_STATUSES:
-            raise HTTPException(status_code=400, detail="未知阅读状态")
-        stmt = stmt.where(effective_read_status == read_status)
-    elif read_later is None and starred is None:
-        stmt = stmt.where(effective_read_status != "dismissed")
-    if read_later is not None:
-        stmt = stmt.where(effective_read_later.is_(read_later))
-    if starred is not None:
-        stmt = stmt.where(effective_starred.is_(starred))
-    if folder_id is not None or source_id is not None or q:
-        matching_clusters = (
-            select(ClusterItem.cluster_id)
-            .join(ContentItem, ContentItem.id == ClusterItem.content_item_id)
-            .join(Source, Source.id == ContentItem.source_id)
-            .join(Cluster, Cluster.id == ClusterItem.cluster_id)
-            .where(Source.status == "active", Source.media_type == "article")
+        active_lookup = False
+    else:
+        stream = cluster_stream_list_query(
+            session,
+            folder_id=folder_id,
+            source_id=source_id,
+            q=q,
+            read_status=read_status,
+            starred=starred,
+            search=STREAM_SEARCH,
+            cursor=cursor,
+            order=order,
+            limit=min(max(limit, 1), 200),
+            offset=max(offset, 0),
         )
-        if folder_id is not None:
-            matching_clusters = matching_clusters.where(Source.folder_id == folder_id)
-        if source_id is not None:
-            matching_clusters = matching_clusters.where(Source.id == source_id)
-        if q and can_use_indexed_search(session, q):
-            matching_clusters = indexed_cluster_search_query(
-                session, q, folder_id, source_id
-            )
-        elif q:
-            matching_clusters = matching_clusters.where(
-                ordinary_content_clause(session, ContentItem.id),
-                search_clause(session, q, include_cluster=True),
-            )
-        if not active_lookup:
-            matching_clusters = matching_clusters.where(
-                unfiltered_content_clause(ContentItem.id)
-            )
-        stmt = stmt.where(Cluster.id.in_(matching_clusters))
-    if cursor is not None:
-        id_after_cursor = Cluster.id > cursor.id if order == "asc" else Cluster.id < cursor.id
-        if cursor.first_seen_at is None:
-            cursor_clause = and_(Cluster.first_seen_at.is_(None), id_after_cursor)
-        else:
-            time_after_cursor = Cluster.first_seen_at > cursor.first_seen_at if order == "asc" else Cluster.first_seen_at < cursor.first_seen_at
-            cursor_clause = or_(
-                time_after_cursor,
-                and_(Cluster.first_seen_at == cursor.first_seen_at, id_after_cursor),
-                Cluster.first_seen_at.is_(None),
-            )
-        stmt = stmt.where(cursor_clause)
-    order_by = (Cluster.first_seen_at.asc().nullslast(), Cluster.id.asc()) if order == "asc" else (Cluster.first_seen_at.desc().nullslast(), Cluster.id.desc())
-    stmt = stmt.group_by(Cluster.id).order_by(*order_by).limit(min(max(limit, 1), 200)).offset(max(offset, 0))
-    rows = session.execute(stmt).all()
+        rows = session.execute(stream.statement).all()
+        active_lookup = stream.active_lookup
     preview_items = cluster_preview_items_for(
         session,
         [cluster.id for cluster, _count in rows],
@@ -3765,69 +3722,20 @@ def count_clusters(
     source_id: int | None = None,
     q: str | None = None,
     read_status: str | None = None,
-    read_later: bool | None = None,
     starred: bool | None = None,
     session: Session = Depends(get_session),
 ) -> dict[str, int]:
-    (
-        current_event_state,
-        effective_read_status,
-        effective_read_later,
-        effective_starred,
-    ) = cluster_effective_state_expressions(session)
-    stmt = (
-        select(func.count(func.distinct(Cluster.id)))
-        .join(ClusterItem, ClusterItem.cluster_id == Cluster.id)
-        .join(ContentItem, ContentItem.id == ClusterItem.content_item_id)
-        .join(Source, Source.id == ContentItem.source_id)
-        .join(current_event_state, current_event_state.c.cluster_id == Cluster.id, isouter=True)
-        .where(
-            Source.status == "active",
-            Source.media_type == "article",
-            func.coalesce(current_event_state.c.uninterested, false()).is_(False),
-            ordinary_content_clause(session, ContentItem.id),
-        )
+    stream = cluster_stream_query(
+        session,
+        (func.count(func.distinct(Cluster.id)),),
+        folder_id=folder_id,
+        source_id=source_id,
+        q=q,
+        read_status=read_status,
+        starred=starred,
+        search=STREAM_SEARCH,
     )
-    active_lookup = source_id is not None or bool(q) or read_later is not None or starred is not None
-    if not active_lookup:
-        stmt = stmt.where(unfiltered_content_clause(ContentItem.id))
-    if read_status:
-        if read_status not in READ_STATUSES:
-            raise HTTPException(status_code=400, detail="未知阅读状态")
-        stmt = stmt.where(effective_read_status == read_status)
-    elif read_later is None and starred is None:
-        stmt = stmt.where(effective_read_status != "dismissed")
-    if read_later is not None:
-        stmt = stmt.where(effective_read_later.is_(read_later))
-    if starred is not None:
-        stmt = stmt.where(effective_starred.is_(starred))
-    if folder_id is not None or source_id is not None or q:
-        matching_clusters = (
-            select(ClusterItem.cluster_id)
-            .join(ContentItem, ContentItem.id == ClusterItem.content_item_id)
-            .join(Source, Source.id == ContentItem.source_id)
-            .join(Cluster, Cluster.id == ClusterItem.cluster_id)
-            .where(Source.status == "active", Source.media_type == "article")
-        )
-        if folder_id is not None:
-            matching_clusters = matching_clusters.where(Source.folder_id == folder_id)
-        if source_id is not None:
-            matching_clusters = matching_clusters.where(Source.id == source_id)
-        if q and can_use_indexed_search(session, q):
-            matching_clusters = indexed_cluster_search_query(
-                session, q, folder_id, source_id
-            )
-        elif q:
-            matching_clusters = matching_clusters.where(
-                ordinary_content_clause(session, ContentItem.id),
-                search_clause(session, q, include_cluster=True),
-            )
-        if not active_lookup:
-            matching_clusters = matching_clusters.where(
-                unfiltered_content_clause(ContentItem.id)
-            )
-        stmt = stmt.where(Cluster.id.in_(matching_clusters))
-    return {"count": int(session.scalar(stmt) or 0)}
+    return {"count": int(session.scalar(stream.statement) or 0)}
 
 
 @app.get("/clusters/{cluster_id}", response_model=ClusterDetailOut)
@@ -4581,10 +4489,13 @@ def ai_chat(payload: AIChatIn, session: Session = Depends(get_session)) -> AICha
 
 @app.post("/translations", response_model=TranslationOut)
 def translate_reading(payload: TranslationIn, session: Session = Depends(get_session)) -> TranslationOut:
+    """翻译异步化（#106）：请求内只做缓存命中或建 pending 任务并入队，
+    LLM 调用全部发生在 worker 作业内；前端以同一 POST 轮询直至终态。"""
     source = session.get(Source, payload.source_id) if payload.source_id else None
     if payload.source_id and (source is None or source.status == "deleted"):
         raise HTTPException(status_code=404, detail="来源不存在")
     ai_settings = translation_settings_for_source(runtime_ai_settings(session), source)
+    model = ai_settings.translation_model
     if payload.blocks:
         blocks = [
             {
@@ -4598,54 +4509,43 @@ def translate_reading(payload: TranslationIn, session: Session = Depends(get_ses
             return TranslationOut(status="empty")
         combined_text = "\n\n".join(block["text"] for block in blocks)
         if not translation_utils.needs_reading_translation(combined_text):
-            return TranslationOut(
-                status="skipped", model_version=ai_settings.translation_model
-            )
+            return TranslationOut(status="skipped", model_version=model)
         source_hash = translation_utils.block_translation_source_hash(blocks)
         expected_ids = [block["id"] for block in blocks]
         cached = translation_utils.latest_block_translation_task(
-            session,
-            ai_settings.translation_provider,
-            ai_settings.translation_model,
-            source_hash,
-            expected_ids,
+            session, ai_settings.translation_provider, model, source_hash, expected_ids
         )
         if cached is not None:
             return translation_snapshot(cached)
-        task = translation_utils.ensure_block_translation(
+        return _pending_translation_response(
             session,
-            translation_chat_provider(ai_settings),
-            ai_settings.translation_model,
-            blocks,
+            payload,
+            ai_settings,
+            source_hash,
+            translation_utils.TRANSLATION_BLOCK_PROMPT_VERSION,
+            blocks=blocks,
+            unavailable_detail="翻译块映射无效",
         )
-        if task is None:
-            raise HTTPException(status_code=502, detail="翻译块映射无效")
-        session.commit()
-        session.refresh(task)
-        return translation_snapshot(task)
     text = payload.text.strip()
     if not text:
         return TranslationOut(status="empty")
     if not translation_utils.needs_reading_translation(text):
-        return TranslationOut(status="skipped", model_version=ai_settings.translation_model)
+        return TranslationOut(status="skipped", model_version=model)
     source_hash = content_hash(text)
-    cached = translation_utils.latest_translation_task(session, ai_settings.translation_provider, ai_settings.translation_model, source_hash)
+    cached = translation_utils.latest_translation_task(
+        session, ai_settings.translation_provider, model, source_hash
+    )
     if cached is not None:
         return translation_snapshot(cached)
-    translation = translation_utils.ensure_translation(
+    return _pending_translation_response(
         session,
-        translation_chat_provider(ai_settings),
-        ai_settings.translation_model,
-        text,
+        payload,
+        ai_settings,
+        source_hash,
+        translation_utils.TRANSLATION_PROMPT_VERSION,
+        text=text,
+        unavailable_detail="翻译模型未返回可用译文",
     )
-    if not translation:
-        raise HTTPException(status_code=502, detail="翻译模型未返回可用译文")
-    session.commit()
-    cached = translation_utils.latest_translation_task(session, ai_settings.translation_provider, ai_settings.translation_model, source_hash)
-    if cached is None:
-        raise HTTPException(status_code=502, detail="翻译缓存写入失败")
-    return translation_snapshot(cached)
-
 
 def filter_item_outputs(
     session: Session, items: list[ContentItem], *, include_content: bool = False
@@ -4726,7 +4626,7 @@ def query_filtered_items(
     else:
         statement = statement.where(Source.status == "active")
     if folder_id is not None:
-        statement = statement.where(Source.folder_id == folder_id)
+        statement = statement.where(Source.folder_id.is_(None) if folder_id == 0 else Source.folder_id == folder_id)
     if media_type:
         if media_type not in SOURCE_MEDIA_TYPES:
             raise HTTPException(status_code=400, detail="不支持的媒体类型")
@@ -4787,7 +4687,6 @@ def query_items(
     media_type: str | None = None,
     q: str | None = None,
     read_status: str | None = None,
-    read_later: bool | None = None,
     starred: bool | None = None,
     item_id: int | None = None,
     limit: int = 80,
@@ -4796,7 +4695,18 @@ def query_items(
     ensure_title_translation: bool = False,
     ensure_translations: bool = False,
     ensure_content_translation: bool = False,
+    cursor_id: int | None = None,
+    cursor_published_at: datetime | Literal["null"] | None = None,
+    order: Literal["desc", "asc"] = "desc",
+    unclassified: bool = False,
 ) -> list[ItemOut]:
+    if order not in {"desc", "asc"}:
+        raise HTTPException(status_code=422, detail="未知排列顺序")
+    if unclassified and folder_id is not None:
+        raise HTTPException(status_code=422, detail="文件夹范围无效")
+    cursor = session.get(ContentItem, cursor_id) if cursor_id is not None else None
+    if cursor_id is not None and cursor is None:
+        raise HTTPException(status_code=400, detail="分页游标不存在")
     stmt = (
         select(ContentItem, Source, UserState)
         .options(
@@ -4819,11 +4729,13 @@ def query_items(
         stmt = stmt.where(ordinary_content_clause(session, ContentItem.id))
     if folder_id is not None:
         stmt = stmt.where(Source.folder_id == folder_id)
+    if unclassified:
+        stmt = stmt.where(Source.folder_id.is_(None))
     if source_id is not None:
         stmt = stmt.where(Source.id == source_id)
     elif item_id is None:
         stmt = stmt.where(Source.status == "active")
-        if not q and read_later is None and starred is None:
+        if not q and starred is None:
             stmt = stmt.where(unfiltered_content_clause(ContentItem.id))
     if media_type:
         if media_type not in SOURCE_MEDIA_TYPES:
@@ -4841,13 +4753,31 @@ def query_items(
             stmt = stmt.where(or_(UserState.id.is_(None), UserState.read_status == "unread"))
         else:
             stmt = stmt.where(UserState.read_status == read_status)
-    elif read_later is None and starred is None and item_id is None:
+    elif starred is None and item_id is None:
         stmt = stmt.where(or_(UserState.id.is_(None), UserState.read_status != "dismissed"))
-    if read_later is not None:
-        stmt = stmt.where(UserState.read_later.is_(True) if read_later else or_(UserState.id.is_(None), UserState.read_later.is_(False)))
     if starred is not None:
         stmt = stmt.where(UserState.starred.is_(True) if starred else or_(UserState.id.is_(None), UserState.starred.is_(False)))
-    stmt = stmt.order_by(ContentItem.published_at.desc().nullslast(), ContentItem.created_at.desc()).limit(min(max(limit, 1), 200)).offset(max(offset, 0))
+    ascending = order == "asc"
+    if cursor is not None:
+        published_at = cursor.published_at if cursor_published_at is None else cursor_published_at
+        after_created = or_(
+            ContentItem.created_at > cursor.created_at if ascending else ContentItem.created_at < cursor.created_at,
+            and_(ContentItem.created_at == cursor.created_at,
+                 ContentItem.id > cursor.id if ascending else ContentItem.id < cursor.id),
+        )
+        boundary = and_(ContentItem.published_at.is_(None), after_created)
+        if published_at is not None and published_at != "null":
+            boundary = or_(
+                ContentItem.published_at > published_at if ascending else ContentItem.published_at < published_at,
+                and_(ContentItem.published_at == published_at, after_created),
+                ContentItem.published_at.is_(None),
+            )
+        stmt = stmt.where(boundary)
+    stmt = stmt.order_by(
+        (ContentItem.published_at.asc() if ascending else ContentItem.published_at.desc()).nullslast(),
+        ContentItem.created_at.asc() if ascending else ContentItem.created_at.desc(),
+        ContentItem.id.asc() if ascending else ContentItem.id.desc(),
+    ).limit(min(max(limit, 1), 200)).offset(max(offset, 0))
     rows = session.execute(stmt).all()
     cached_translations = None
     if not ensure_title_translation and not ensure_translations:
@@ -4870,7 +4800,6 @@ def query_items(
         if item_id is not None
         or source_id is not None
         or bool(q)
-        or read_later is not None
         or starred is not None
         else {}
     )
@@ -4996,7 +4925,9 @@ def bulk_unread_ids(session: Session, payload: BulkReadPrepareIn) -> list[int]:
             or_(UserState.id.is_(None), UserState.read_status == "unread"),
             ordinary_content_clause(session, ContentItem.id),
         )
-        if payload.source_id is None and not payload.q:
+        if not include_filtered_for_scope(
+        source_id=payload.source_id, q=payload.q, starred_view=False
+    ):
             stmt = stmt.where(unfiltered_content_clause(ContentItem.id))
         if payload.folder_id is not None:
             stmt = stmt.where(Source.folder_id == payload.folder_id)
@@ -5010,7 +4941,7 @@ def bulk_unread_ids(session: Session, payload: BulkReadPrepareIn) -> list[int]:
             stmt = stmt.where(search_clause(session, payload.q))
         return list(session.scalars(stmt).all())
 
-    current_event_state, effective_read_status, _, _ = (
+    current_event_state, effective_read_status, _ = (
         cluster_effective_state_expressions(session)
     )
     matching = (
@@ -5028,7 +4959,9 @@ def bulk_unread_ids(session: Session, payload: BulkReadPrepareIn) -> list[int]:
             ordinary_content_clause(session, ContentItem.id),
         )
     )
-    if payload.source_id is None and not payload.q:
+    if not include_filtered_for_scope(
+        source_id=payload.source_id, q=payload.q, starred_view=False
+    ):
         matching = matching.where(unfiltered_content_clause(ContentItem.id))
     if payload.folder_id is not None:
         matching = matching.where(Source.folder_id == payload.folder_id)
@@ -5086,7 +5019,6 @@ def item_out(
         url=item.url,
         published_at=item.published_at,
         read_status=state.read_status if state else "unread",
-        read_later=state.read_later if state else False,
         starred=state.starred if state else False,
         filtered=bool(filter_rules),
         filter_rules=filter_rules or [],
@@ -5155,7 +5087,6 @@ def event_source_item_out(
         url=version.url_snapshot,
         published_at=version.published_at_snapshot,
         read_status=state.read_status if state else "unread",
-        read_later=state.read_later if state else False,
         starred=state.starred if state else False,
         filtered=bool(filter_rules),
         filter_rules=filter_rules or [],
@@ -5260,7 +5191,6 @@ def source_out(
         read_count=metric.read_count if metric else 0,
         opened_count=metric.opened_count if metric else 0,
         starred_count=metric.starred_count if metric else 0,
-        read_later_count=metric.read_later_count if metric else 0,
         cluster_count=cluster_count,
         duplicate_count=duplicate_count,
         recent_entry_count_30d=recent_entry_count_30d,
@@ -5283,7 +5213,6 @@ def cluster_out(
     if ensure_translations:
         ensure_reading_translations(session, [cluster.generated_title])
     read_status = event_identity.read_status if event_identity else "unread"
-    read_later = event_identity.read_later if event_identity else False
     starred = event_identity.starred if event_identity else False
     return ClusterOut(
         id=cluster.id,
@@ -5317,7 +5246,6 @@ def cluster_out(
         last_seen_at=cluster.last_seen_at,
         item_count=item_count,
         read_status=read_status,
-        read_later=read_later,
         starred=starred,
         uninterested=event_identity.uninterested if event_identity else False,
         uninterested_reason=(
@@ -5401,7 +5329,6 @@ def topic_out(topic: TopicGroup, clusters: list[ClusterOut], state: UserState | 
         cluster_count=len(clusters),
         last_seen_at=last_seen,
         read_status=state.read_status if state else "unread",
-        read_later=state.read_later if state else False,
         starred=state.starred if state else False,
     )
 
@@ -5440,7 +5367,7 @@ def topic_clusters(session: Session, query: str) -> list[ClusterOut]:
         .where(or_(*matches))
         .distinct()
     )
-    current_event_state, effective_read_status, _, _ = (
+    current_event_state, effective_read_status, _ = (
         cluster_effective_state_expressions(session)
     )
     stmt = (
@@ -5567,7 +5494,6 @@ def report_state_fields(period: str, start: datetime, state: UserState | None) -
     return {
         "object_id": report_state_key(period, start),
         "read_status": state.read_status if state else "unread",
-        "read_later": state.read_later if state else False,
         "starred": state.starred if state else False,
     }
 
@@ -6209,3 +6135,84 @@ def base_cluster_search_query(
     if source_id is not None:
         stmt = stmt.where(Source.id == source_id)
     return stmt
+
+
+STREAM_SEARCH = StreamSearch(
+    can_use_indexed=can_use_indexed_search,
+    indexed_membership=indexed_cluster_search_query,
+    clause=search_clause,
+)
+
+
+def _pending_translation_response(
+    session: Session,
+    payload: TranslationIn,
+    ai_settings,
+    source_hash: str,
+    prompt_version: str,
+    *,
+    text: str | None = None,
+    blocks: list[dict[str, str]] | None = None,
+    unavailable_detail: str,
+) -> TranslationOut:
+    # 身份从设置直接推导，不在请求内构造 provider（LLM 客户端只在
+    # worker 作业里初始化）；配置校验保持与旧同步路径一致。
+    model = ai_settings.translation_model
+    if not model:
+        raise HTTPException(status_code=502, detail=unavailable_detail)
+    validate_translation_profile(
+        ai_settings.translation_provider,
+        ai_settings.translation_base_url,
+        ai_settings.translation_api_key,
+    )
+    provider_name = (
+        ai_settings.translation_provider
+        if ai_settings.translation_provider in {"local", "openai_compatible"}
+        else "local"
+    )
+    pending = translation_utils.find_pending_translation_task(
+        session, provider_name, model, source_hash, prompt_version
+    )
+    if pending is not None:
+        # Allow the DB commit -> enqueue handoff to finish before checking RQ.
+        age = (now_utc() - pending.updated_at.replace(tzinfo=timezone.utc)).total_seconds()
+        if age < 30:
+            return TranslationOut(status="pending", model_version=model)
+        active = translation_job_is_active(pending.id)
+        if active is None:
+            raise HTTPException(status_code=503, detail="翻译队列不可用")
+        if active:
+            return TranslationOut(status="pending", model_version=model)
+        session.execute(
+            update(LLMTask)
+            .where(LLMTask.id == pending.id, LLMTask.status == "pending")
+            .values(status="error", updated_at=now_utc())
+            .execution_options(synchronize_session=False)
+        )
+        session.commit()
+        session.refresh(pending)
+        if pending.status == "complete":
+            return translation_snapshot(pending)
+    if not payload.retry:
+        errored = translation_utils.latest_error_translation_task(
+            session, provider_name, model, source_hash, prompt_version
+        )
+        if errored is not None:
+            return TranslationOut(status="error", model_version=model)
+    task = translation_utils.create_pending_translation_task(
+        session,
+        provider_name,
+        model,
+        text=text,
+        blocks=blocks,
+        source_id=payload.source_id,
+    )
+    session.commit()
+    if not enqueue_translation_job(task.id):
+        session.delete(task)
+        session.commit()
+        raise HTTPException(status_code=503, detail="翻译队列不可用")
+    return TranslationOut(status="pending", model_version=model)
+
+
+IMAGE_ERROR_CACHE_HEADERS = {"Cache-Control": "public, max-age=3600"}

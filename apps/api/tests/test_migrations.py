@@ -33,9 +33,11 @@ from reader_api.models import (
     ClusterEventProjection,
     Source,
 )
+from reader_api.production_target import PRODUCTION_HOSTS_ENV
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
+TEST_PRODUCTION_HOST = "192.0.2.10"
 
 
 def test_complete_legacy_snapshot_passes_preflight() -> None:
@@ -61,9 +63,9 @@ def test_architecture_records_current_migration_head() -> None:
         encoding="utf-8"
     )
 
-    assert code_head_revisions() == ("0072_reading_body_contract",)
-    assert "`0072_reading_body_contract`" in architecture
-    assert "0072_reading_body_contract" in architecture.partition(
+    assert code_head_revisions() == ("0075_stream_hot_path_indexes",)
+    assert "`0075_stream_hot_path_indexes`" in architecture
+    assert "0075_stream_hot_path_indexes" in architecture.partition(
         "当前为唯一代码 head"
     )[0]
 
@@ -86,7 +88,7 @@ def test_generation_runner_claim_lease_rejects_in_place_downgrade() -> None:
         migration.downgrade()
 
 
-def test_mac_runner_audit_rejects_in_place_downgrade() -> None:
+def test_legacy_runner_audit_rejects_in_place_downgrade() -> None:
     migration = importlib.import_module(
         "reader_api.alembic.versions.0059_legacy_runner_audit"
     )
@@ -207,6 +209,24 @@ def test_source_fetch_validators_rejects_in_place_downgrade() -> None:
 def test_reading_body_contract_rejects_in_place_downgrade() -> None:
     migration = importlib.import_module(
         "reader_api.alembic.versions.0072_reading_body_contract"
+    )
+
+    with pytest.raises(RuntimeError, match="恢复迁移前备份"):
+        migration.downgrade()
+
+
+def test_unified_saved_state_rejects_in_place_downgrade() -> None:
+    migration = importlib.import_module(
+        "reader_api.alembic.versions.0073_unified_saved_state"
+    )
+
+    with pytest.raises(RuntimeError, match="恢复迁移前备份"):
+        migration.downgrade()
+
+
+def test_event_evidence_reading_html_rejects_in_place_downgrade() -> None:
+    migration = importlib.import_module(
+        "reader_api.alembic.versions.0074_event_evidence_reading_html"
     )
 
     with pytest.raises(RuntimeError, match="恢复迁移前备份"):
@@ -900,7 +920,7 @@ def test_isolated_postgres_test_url_guard_accepts_only_explicit_local_test_datab
     "url",
     [
         "postgresql+psycopg://reader:reader@127.0.0.1:55438/reader",
-        "postgresql+psycopg://reader:reader@192.0.2.6:5432/reader_test_migrations",
+        f"postgresql+psycopg://reader:reader@{TEST_PRODUCTION_HOST}:5432/reader_test_migrations",
         "sqlite:///reader_test_migrations.db",
     ],
 )
@@ -912,7 +932,7 @@ def test_isolated_postgres_test_url_guard_rejects_production_or_non_postgres_tar
 def test_isolated_postgres_test_url_guard_rejects_query_parameter_target_override() -> None:
     disguised_production_url = (
         "postgresql+psycopg://reader_test:reader_test@127.0.0.1:55439/reader_test_migrations"
-        "?host=192.0.2.6&port=5432&dbname=reader"
+        f"?host={TEST_PRODUCTION_HOST}&port=5432&dbname=reader"
     )
 
     with pytest.raises(ValueError, match="查询参数"):
@@ -1005,7 +1025,7 @@ def test_migration_cli_requires_dedicated_url_without_database_fallback(monkeypa
     monkeypatch.delenv("READER_MIGRATION_DATABASE_URL", raising=False)
     monkeypatch.setenv(
         "DATABASE_URL",
-        "postgresql+psycopg://reader:reader@192.0.2.6:5432/reader",
+        f"postgresql+psycopg://reader:reader@{TEST_PRODUCTION_HOST}:5432/reader",
     )
 
     with pytest.raises(RuntimeError, match="不会回退"):
@@ -1015,7 +1035,9 @@ def test_migration_cli_requires_dedicated_url_without_database_fallback(monkeypa
 def test_migration_cli_rejects_production_target_without_explicit_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    production_url = "postgresql+psycopg://reader:reader@postgres:5432/reader"
+    production_url = (
+        f"postgresql+psycopg://reader:reader@{TEST_PRODUCTION_HOST}:5432/reader"
+    )
     monkeypatch.setenv("READER_MIGRATION_DATABASE_URL", production_url)
     monkeypatch.delenv("READER_MIGRATION_ALLOW_PRODUCTION", raising=False)
 
@@ -1029,6 +1051,8 @@ def test_migration_cli_rejects_production_target_without_explicit_override(
 @pytest.mark.parametrize(
     "host",
     (
+        TEST_PRODUCTION_HOST,
+        f"{TEST_PRODUCTION_HOST}.",
         "postgres",
         "reader-postgres",
         "postgres.",
@@ -1036,6 +1060,7 @@ def test_migration_cli_rejects_production_target_without_explicit_override(
         "postgres。",
         "postgres．",
         "postgres｡",
+        f"[::ffff:{TEST_PRODUCTION_HOST}]",
     ),
 )
 def test_migration_cli_rejects_known_production_host_for_rehearsal_database(
@@ -1047,6 +1072,7 @@ def test_migration_cli_rejects_known_production_host_for_rehearsal_database(
         "reader_p01_rehearsal_issue15"
     )
     monkeypatch.setenv("READER_MIGRATION_DATABASE_URL", database_url)
+    monkeypatch.setenv(PRODUCTION_HOSTS_ENV, TEST_PRODUCTION_HOST)
     monkeypatch.delenv("READER_MIGRATION_ALLOW_PRODUCTION", raising=False)
 
     with pytest.raises(RuntimeError, match="拒绝迁移疑似生产数据库"):
@@ -1060,7 +1086,7 @@ def test_migration_cli_rejects_known_production_host_for_rehearsal_database(
         "0xc0000206",
         "192.000.002.006",
         "0300.000.002.006",
-        "192.2.6",
+        "192.0.518",
     ),
 )
 def test_migration_cli_rejects_ambiguous_numeric_host(
@@ -1092,7 +1118,9 @@ def test_migration_cli_requires_explicit_database_host(
 def test_read_only_head_check_allows_production_without_migration_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    production_url = "postgresql+psycopg://reader:reader@postgres:5432/reader"
+    production_url = (
+        f"postgresql+psycopg://reader:reader@{TEST_PRODUCTION_HOST}:5432/reader"
+    )
     monkeypatch.setenv("READER_MIGRATION_DATABASE_URL", production_url)
     monkeypatch.delenv("READER_MIGRATION_ALLOW_PRODUCTION", raising=False)
 
@@ -1105,7 +1133,9 @@ def test_read_only_head_check_allows_production_without_migration_override(
 def test_folder_type_prepare_cli_requires_three_production_signals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    production_url = "postgresql+psycopg://reader:reader@postgres:5432/reader"
+    production_url = (
+        f"postgresql+psycopg://reader:reader@{TEST_PRODUCTION_HOST}:5432/reader"
+    )
     monkeypatch.setenv("READER_MIGRATION_DATABASE_URL", production_url)
     monkeypatch.delenv("READER_MIGRATION_ALLOW_PRODUCTION", raising=False)
     monkeypatch.delenv("READER_DEPLOYMENT_ALLOW_PRODUCTION", raising=False)
@@ -1150,7 +1180,7 @@ def test_folder_type_prepare_cli_requires_three_production_signals(
             "apply": True,
             "target": {
                 "database": "reader",
-                "host": "postgres",
+                "host": TEST_PRODUCTION_HOST,
                 "port": 5432,
                 "username": "reader",
                 "production_authorized": True,
@@ -1165,7 +1195,7 @@ def test_migration_cli_rejects_query_parameter_target_override(
 ) -> None:
     disguised_production_url = (
         "postgresql+psycopg://reader_test:reader_test@127.0.0.1:55439/reader_test_migrations"
-        "?host=192.0.2.6&port=5432&dbname=reader"
+        f"?host={TEST_PRODUCTION_HOST}&port=5432&dbname=reader"
     )
     monkeypatch.setenv("READER_MIGRATION_DATABASE_URL", disguised_production_url)
     monkeypatch.setenv("READER_MIGRATION_ALLOW_PRODUCTION", "1")
@@ -1177,7 +1207,7 @@ def test_migration_cli_rejects_query_parameter_target_override(
 def test_internal_migration_engine_rejects_query_parameter_target_override() -> None:
     disguised_production_url = (
         "postgresql+psycopg://reader_test:reader_test@127.0.0.1:55439/reader_test_migrations"
-        "?host=192.0.2.6&port=5432&dbname=reader"
+        f"?host={TEST_PRODUCTION_HOST}&port=5432&dbname=reader"
     )
 
     with pytest.raises(ValueError, match="查询参数"):
@@ -1188,7 +1218,7 @@ def test_migration_cli_rejects_authority_multi_host_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     multi_host_url = (
-        "postgresql+psycopg://reader:reader@192.0.2.6,127.0.0.1/reader_copy"
+        f"postgresql+psycopg://reader:reader@{TEST_PRODUCTION_HOST},127.0.0.1/reader_copy"
     )
     monkeypatch.setenv("READER_MIGRATION_DATABASE_URL", multi_host_url)
     monkeypatch.setenv("READER_MIGRATION_ALLOW_PRODUCTION", "1")

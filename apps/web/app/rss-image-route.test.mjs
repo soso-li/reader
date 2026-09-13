@@ -12,6 +12,7 @@ test("RSS image failures stay same-origin so the client can show its placeholder
     globalThis.fetch = async () => new Response("missing", { status: 404 });
     const response = await GET(new Request("http://reader.test/images/rss?src=https%3A%2F%2F93.184.216.34%2Fmissing.jpg"));
     assert.equal(response.status, 502);
+    assert.equal(response.headers.get("cache-control"), "public, max-age=3600");
     assert.equal(response.headers.get("location"), null);
   } finally {
     globalThis.fetch = originalFetch;
@@ -64,6 +65,7 @@ test("RSS image proxy propagates cancellation to the API downloader", async () =
     );
     const response = await GET(request);
     assert.equal(response.status, 502);
+    assert.equal(response.headers.get("cache-control"), "public, max-age=3600");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -94,6 +96,7 @@ test("RSS image proxy accepts octet-stream only when it contains a supported ima
     globalThis.fetch = async () => new Response("not an image", { headers: { "content-type": "application/octet-stream" } });
     const invalidResponse = await GET(new Request("http://reader.test/images/rss?src=https%3A%2F%2F93.184.216.34%2Ffile"));
     assert.equal(invalidResponse.status, 502);
+    assert.equal(invalidResponse.headers.get("cache-control"), "public, max-age=3600");
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -105,6 +108,7 @@ test("RSS image proxy rejects active SVG content", async () => {
     globalThis.fetch = async () => new Response("<svg><script>alert(1)</script></svg>", { headers: { "content-type": "image/svg+xml" } });
     const response = await GET(new Request("http://reader.test/images/rss?src=https%3A%2F%2F93.184.216.34%2Factive.svg"));
     assert.equal(response.status, 502);
+    assert.equal(response.headers.get("cache-control"), "public, max-age=3600");
   } finally {
     globalThis.fetch = originalFetch;
   }

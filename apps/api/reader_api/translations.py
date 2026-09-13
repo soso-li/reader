@@ -304,6 +304,174 @@ def block_translation_source_hash(blocks: list[dict[str, str]]) -> str:
     )
 
 
+def find_pending_translation_task(
+    session: Session,
+    provider_name: str,
+    model: str,
+    source_hash: str,
+    prompt_version: str,
+) -> LLMTask | None:
+    """同一翻译身份的未完成任务（#106 异步化：轮询去重，不重复入队）。"""
+    return session.scalars(
+        select(LLMTask)
+        .where(
+            LLMTask.task_type == TRANSLATION_TASK_TYPE,
+            LLMTask.object_type == "text",
+            LLMTask.object_id == translation_object_id(source_hash),
+            LLMTask.status == "pending",
+            LLMTask.provider == provider_name,
+            LLMTask.model_version == model,
+            LLMTask.prompt_version == prompt_version,
+        )
+        .order_by(LLMTask.id.desc())
+    ).first()
+
+
+def latest_error_translation_task(
+    session: Session,
+    provider_name: str,
+    model: str,
+    source_hash: str,
+    prompt_version: str,
+) -> LLMTask | None:
+    return session.scalars(
+        select(LLMTask)
+        .where(
+            LLMTask.task_type == TRANSLATION_TASK_TYPE,
+            LLMTask.object_type == "text",
+            LLMTask.object_id == translation_object_id(source_hash),
+            LLMTask.status == "error",
+            LLMTask.provider == provider_name,
+            LLMTask.model_version == model,
+            LLMTask.prompt_version == prompt_version,
+        )
+        .order_by(LLMTask.updated_at.desc(), LLMTask.id.desc())
+    ).first()
+
+
+def create_pending_translation_task(
+    session: Session,
+    provider_name: str,
+    model: str,
+    *,
+    text: str | None = None,
+    blocks: list[dict[str, str]] | None = None,
+    source_id: int | None = None,
+) -> LLMTask:
+    """建 pending 翻译任务；输入（含来源隐私推导所需 source_id）暂存于
+    result_json，由 worker 作业消费。"""
+    if blocks is not None:
+        source_hash = block_translation_source_hash(blocks)
+        prompt_version = TRANSLATION_BLOCK_PROMPT_VERSION
+        payload: dict[str, object] = {"source_hash": source_hash, "input_blocks": blocks}
+    else:
+        assert text is not None
+        source_hash = content_hash(text)
+        prompt_version = TRANSLATION_PROMPT_VERSION
+        payload = {"source_hash": source_hash, "input_text": text}
+    if source_id is not None:
+        payload["source_id"] = source_id
+    task = LLMTask(
+        task_type=TRANSLATION_TASK_TYPE,
+        provider=provider_name,
+        object_type="text",
+        object_id=translation_object_id(source_hash),
+    )
+    task.status = "pending"
+    task.prompt_version = prompt_version
+    task.model_version = model
+    task.result_json = json.dumps(payload, ensure_ascii=False)
+    task.updated_at = now_utc()
+    session.add(task)
+    session.flush()
+    return task
+
+
+def run_pending_translation_task(
+    session: Session, task: LLMTask, provider: LLMProvider | None
+) -> None:
+    """在 worker 内执行 pending 翻译任务并落定 complete/error 终态。
+
+    LLM 调用只发生在这里；advisory 锁与二次缓存检查从旧的请求内路径
+    原样迁移，用于对相同身份的并发作业去重。"""
+    try:
+        data = json.loads(task.result_json or "{}")
+    except json.JSONDecodeError:
+        data = {}
+    source_hash = str(data.get("source_hash") or "")
+    if not source_hash or provider is None or not task.model_version:
+        _finalize_translation_error(task, source_hash, "翻译设置不可用或任务输入损坏")
+        return
+    acquire_translation_lock(
+        session, content_hash(task.provider, task.model_version, source_hash)
+    )
+    if task.prompt_version == TRANSLATION_BLOCK_PROMPT_VERSION:
+        blocks = data.get("input_blocks")
+        if not isinstance(blocks, list) or not blocks:
+            _finalize_translation_error(task, source_hash, "翻译任务缺少块输入")
+            return
+        expected_ids = [str(block.get("id")) for block in blocks]
+        cached = latest_block_translation_task(
+            session, task.provider, task.model_version, source_hash, expected_ids
+        )
+        if cached is not None:
+            task.result_json = cached.result_json
+            task.status = "complete"
+            task.updated_at = now_utc()
+            return
+        try:
+            translated, combined_translation = translate_blocks(
+                provider, task.model_version, blocks
+            )
+        except Exception:
+            translated, combined_translation = [], ""
+        if not translated:
+            _finalize_translation_error(task, source_hash, "翻译模型未返回可用译文")
+            return
+        task.result_json = json.dumps(
+            {
+                "source_hash": source_hash,
+                "translation": combined_translation,
+                "blocks": translated,
+            },
+            ensure_ascii=False,
+        )
+    else:
+        text = str(data.get("input_text") or "")
+        if not text.strip():
+            _finalize_translation_error(task, source_hash, "翻译任务缺少文本输入")
+            return
+        cached = latest_translation_task(
+            session, task.provider, task.model_version, source_hash
+        )
+        if cached is not None:
+            task.result_json = cached.result_json
+            task.status = "complete"
+            task.updated_at = now_utc()
+            return
+        try:
+            translation = translate_text(provider, task.model_version, text)
+        except Exception:
+            translation = ""
+        if not translation:
+            _finalize_translation_error(task, source_hash, "翻译模型未返回可用译文")
+            return
+        task.result_json = json.dumps(
+            {"source_hash": source_hash, "translation": translation},
+            ensure_ascii=False,
+        )
+    task.status = "complete"
+    task.updated_at = now_utc()
+
+
+def _finalize_translation_error(task: LLMTask, source_hash: str, message: str) -> None:
+    task.status = "error"
+    task.result_json = json.dumps(
+        {"source_hash": source_hash, "error": message}, ensure_ascii=False
+    )
+    task.updated_at = now_utc()
+
+
 def latest_block_translation_task(
     session: Session,
     provider_name: str,

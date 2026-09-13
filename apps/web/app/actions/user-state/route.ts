@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server.js";
 
 import { apiFetch } from "../../lib/api";
 import { isObjectUserStateType } from "../../object-user-state";
@@ -18,15 +18,18 @@ export async function POST(request: NextRequest) {
         : randomUUID()
   };
   const readStatus = form.get("read_status");
-  const readLater = form.get("read_later");
   const starred = form.get("starred");
+  const readLater = form.get("read_later");
   if (typeof readStatus === "string") payload.read_status = readStatus;
-  if (typeof readLater === "string") payload.read_later = readLater === "true";
-  if (typeof starred === "string") payload.starred = starred === "true";
   const redirect = form.get("redirect");
   const referer = request.headers.get("referer");
   const base = referer || request.url;
   const target = typeof redirect === "string" && redirect.startsWith("/") ? cleanActionUrl(request, new URL(redirect, base)) : cleanActionUrl(request, referer || "/");
+  if (typeof starred === "string" && typeof readLater === "string") {
+    return NextResponse.redirect(actionErrorUrl(request, target, new Error("收藏状态字段冲突"), "阅读状态更新失败"), 303);
+  }
+  const saved = typeof starred === "string" ? starred : readLater;
+  if (typeof saved === "string") payload.starred = saved === "true";
   if (readStatus === "unread" && ["report", "topic"].includes(objectType)) {
     target.searchParams.set("skip_seen", "1");
   } else {

@@ -102,6 +102,9 @@ def test_completed_projection_creates_one_idempotent_event_graph_and_exposes_it(
             document_type="normal_article",
             title=raw.title,
             content_text=raw.raw_content,
+            reading_html="<article><h1>Frozen projection body</h1></article>",
+            body_source="rss",
+            web_fetch_status="not_requested",
         )
         session.add(document)
         session.flush()
@@ -119,6 +122,11 @@ def test_completed_projection_creates_one_idempotent_event_graph_and_exposes_it(
         )
         session.add(item)
         session.flush()
+        item_id = item.id
+        session.commit()
+        session.expunge_all()
+        item = session.get(ContentItem, item_id)
+        assert item is not None
 
         with clustering_run(
             session,
@@ -154,6 +162,11 @@ def test_completed_projection_creates_one_idempotent_event_graph_and_exposes_it(
         assert event.current_revision_id == revision.id
         assert revision.event_id == event.id
         assert revision.revision_no == 1
+        version = session.scalar(select(EventEvidenceVersion))
+        assert version is not None
+        assert version.reading_html_snapshot == (
+            "<article><h1>Frozen projection body</h1></article>"
+        )
 
         project_completed_clustering_run(session, run_id, [cluster.id])
         session.commit()

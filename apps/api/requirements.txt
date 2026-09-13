@@ -14,3 +14,4 @@ httpx==0.28.1
 jsonschema==4.23.0
 trafilatura==2.1.0
 cssselect==1.5.0
+markdown-it-py==4.0.0

@@ -82,7 +82,11 @@ async function readLimitedBody(response: Response, limit: number) {
 }
 
 function unavailableImage() {
-  return new Response("图片不可用", { status: 502 });
+  // 失败响应可被浏览器短缓存，避免坏图每次渲染都重打代理与 API。
+  return new Response("图片不可用", {
+    status: 502,
+    headers: { "Cache-Control": "public, max-age=3600" }
+  });
 }
 
 async function trimLightBorder(buffer: Buffer, contentType: string) {

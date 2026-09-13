@@ -11,6 +11,7 @@ import { DetailScrollProgress, DetailScrollTopButton, useDetailScroll } from "./
 import Favicon from "./favicon";
 import ListPaneResizer from "./list-pane-resizer";
 import { listFilterQuery, loadBrowseList, normalizeListFilter } from "./list-api";
+import { withPageTimeout } from "./page-fetch-signal";
 import { setMobileDetail, setMobileList } from "./mobile-pane";
 import PullRefresh from "./pull-refresh";
 import SearchBox from "./search-box";
@@ -40,8 +41,9 @@ type Item = BrowseCardItem & {
   uninterested_note: string | null;
   uninterested_at: string | null;
 };
-type ItemStatePatch = Partial<Pick<Item, "read_status" | "read_later" | "starred">>;
+type ItemStatePatch = Partial<Pick<Item, "read_status" | "starred">>;
 type BrowseListAction = "original" | "read" | "star";
+const AUTO_RETRY_DELAY_MS = 1500;
 
 export default function BrowseView({
   apiUrl,
@@ -96,15 +98,19 @@ export default function BrowseView({
   const [detailStateError, setDetailStateError] = useState("");
   const [detailPending, setDetailPending] = useState(false);
   const [nextOffset, setNextOffset] = useState(offset + initialPageCount);
+  const [nextCursor, setNextCursor] = useState(items.at(-1) ?? null);
   const [hasMore, setHasMore] = useState(initialPageCount >= pageSize);
   const [loadingMore, setLoadingMore] = useState(false);
   const [loadError, setLoadError] = useState("");
+  const [retryNonce, setRetryNonce] = useState(0);
   const [overrides, setOverrides] = useState<Record<number, ItemStatePatch>>({});
   const [pendingState, setPendingState] = useState("");
   const [imageLayout, setImageLayout] = useState<"masonry" | "grid">("masonry");
   const listPaneRef = useRef<HTMLElement | null>(null);
   const loadMoreRef = useRef<HTMLDivElement | null>(null);
   const loadingMoreRef = useRef(false);
+  const autoRetryCountRef = useRef(0);
+  const autoRetryTimerRef = useRef<number | null>(null);
   const listRequestId = useRef(0);
   const listAbortController = useRef<AbortController | null>(null);
   const pageRequestId = useRef(0);
@@ -237,6 +243,7 @@ export default function BrowseView({
         setActiveSourceId(nextRange.sourceId);
         setLoadedItems(nextRows);
         setNextOffset(nextRows.length);
+        setNextCursor(nextRows.at(-1) ?? null);
         setHasMore(nextRows.length >= pageSize);
         setLoadError("");
         setOverrides({});
@@ -316,6 +323,11 @@ export default function BrowseView({
     pageRequestId.current += 1;
     loadingMoreRef.current = false;
     setLoadingMore(false);
+    if (autoRetryTimerRef.current !== null) {
+      window.clearTimeout(autoRetryTimerRef.current);
+      autoRetryTimerRef.current = null;
+    }
+    autoRetryCountRef.current = 0;
   }
 
   function invalidateDetailRequest(nextId: number | null) {
@@ -345,6 +357,7 @@ export default function BrowseView({
     setListStateError("");
     setDetailStateError("");
     setNextOffset(offset + initialPageCount);
+    setNextCursor(items.at(-1) ?? null);
     setHasMore(initialPageCount >= pageSize);
     setLoadingMore(false);
     setLoadError("");
@@ -427,6 +440,7 @@ export default function BrowseView({
     listAbortController.current?.abort();
     pageAbortController.current?.abort();
     detailAbortController.current?.abort();
+    if (autoRetryTimerRef.current !== null) window.clearTimeout(autoRetryTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -454,29 +468,50 @@ export default function BrowseView({
     pageAbortController.current?.abort();
     pageAbortController.current = controller;
     const requestId = ++pageRequestId.current;
-    fetch(`${apiUrl.replace(/\/$/, "")}/items?${queryString({ ...listFilterQuery(clientScope.filter), media_type: clientScope.media, folder_id: clientScope.folder_id, source_id: clientScope.source_id, q: clientScope.q, filtered_only: filteredOnly ? "true" : undefined, limit: pageSize, offset: nextOffset, include_content: false })}`, { cache: "no-store", signal: controller.signal })
+    fetch(`${apiUrl.replace(/\/$/, "")}/items?${queryString({ ...listFilterQuery(clientScope.filter), media_type: clientScope.media, folder_id: clientScope.folder_id, source_id: clientScope.source_id, q: clientScope.q, filtered_only: filteredOnly ? "true" : undefined, limit: pageSize, offset: filteredOnly ? nextOffset : undefined, cursor_id: filteredOnly ? undefined : nextCursor?.id, cursor_published_at: !filteredOnly && nextCursor ? nextCursor.published_at ?? "null" : undefined, include_content: false })}`, { cache: "no-store", signal: withPageTimeout(controller.signal) })
       .then((response) => {
         if (!response.ok) throw new Error("更多条目加载失败");
         return response.json();
       })
       .then((nextRows: Item[]) => {
         if (requestId !== pageRequestId.current) return;
+        autoRetryCountRef.current = 0;
         setLoadedItems((current) => {
           const existing = new Set(current.map((item) => item.id));
           return [...current, ...nextRows.filter((item) => !existing.has(item.id))];
         });
         setNextOffset((current) => current + nextRows.length);
+        setNextCursor(nextRows.at(-1) ?? null);
         setHasMore(nextRows.length >= pageSize);
       })
       .catch((error: unknown) => {
-        if (!(error instanceof DOMException && error.name === "AbortError")) setLoadError("更多条目加载失败");
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        if (requestId !== pageRequestId.current) return;
+        setLoadError("更多条目加载失败");
+        if (autoRetryCountRef.current === 0) {
+          autoRetryCountRef.current += 1;
+          autoRetryTimerRef.current = window.setTimeout(() => {
+            autoRetryTimerRef.current = null;
+            setRetryNonce((nonce) => nonce + 1);
+          }, AUTO_RETRY_DELAY_MS);
+        }
       })
       .finally(() => {
         if (requestId !== pageRequestId.current) return;
         loadingMoreRef.current = false;
         setLoadingMore(false);
       });
-  }, [apiUrl, clientScope.filter, clientScope.folder_id, clientScope.media, clientScope.q, clientScope.source_id, filteredOnly, hasMore, nextOffset, pageSize]);
+  }, [apiUrl, clientScope.filter, clientScope.folder_id, clientScope.media, clientScope.q, clientScope.source_id, filteredOnly, hasMore, nextOffset, nextCursor, pageSize]);
+
+  const retryLoadMore = useCallback(() => {
+    if (autoRetryTimerRef.current !== null) {
+      window.clearTimeout(autoRetryTimerRef.current);
+      autoRetryTimerRef.current = null;
+    }
+    setLoadError("");
+    setRetryNonce((nonce) => nonce + 1);
+    loadMore();
+  }, [loadMore]);
 
   useEffect(() => {
     const root = document.querySelector(".browse-list-pane");
@@ -490,7 +525,7 @@ export default function BrowseView({
     );
     observer.observe(target);
     return () => observer.disconnect();
-  }, [hasMore, loadMore]);
+  }, [hasMore, loadMore, retryNonce]);
 
   function selectItem(event: MouseEvent<HTMLAnchorElement>, item: Item, href: string) {
     if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey || event.button > 0) return;
@@ -526,7 +561,7 @@ export default function BrowseView({
     void sendClientUserState({ object_type: "item", object_id: item.id, ...patch })
       .then(() => undefined)
       .catch(() => {
-        setOverrides((current) => ({ ...current, [item.id]: { ...current[item.id], read_status: item.read_status, read_later: item.read_later, starred: item.starred } }));
+        setOverrides((current) => ({ ...current, [item.id]: { ...current[item.id], read_status: item.read_status, starred: item.starred } }));
         if (surface === "list") setListStateError("阅读状态保存失败，请重试。");
         else setDetailStateError("阅读状态保存失败，请重试。");
       })
@@ -535,10 +570,6 @@ export default function BrowseView({
 
   function toggleRead(item: Item, surface: "list" | "detail") {
     updateItemState(item, { read_status: isSeenStatus(item.read_status) ? "unread" : "summary_seen" }, "read", surface);
-  }
-
-  function toggleReadLater(item: Item, surface: "list" | "detail") {
-    updateItemState(item, { read_later: !item.read_later }, "read-later", surface);
   }
 
   function toggleStar(item: Item, surface: "list" | "detail") {
@@ -576,7 +607,6 @@ export default function BrowseView({
         </a>
         <StateButton active={isSeenStatus(item.read_status)} disabled={pendingState === "read"} label={isSeenStatus(item.read_status) ? "标记未读" : "标记看过"} onClick={() => toggleRead(item, "detail")} />
         <StateButton active={item.starred} disabled={pendingState === "star"} icon object={{ id: item.id, starred: item.starred }} onClick={() => toggleStar(item, "detail")} />
-        <StateButton active={item.read_later} disabled={pendingState === "read-later"} label="稍后阅读" onClick={() => toggleReadLater(item, "detail")} />
         <ReduceSimilarButton
           compact
           key={`uninterested-${item.id}`}
@@ -813,6 +843,7 @@ export default function BrowseView({
           loadingMore={loadingMore}
           media={media}
           onAction={handleListAction}
+          onRetryLoadMore={retryLoadMore}
           onSelect={handleSelectItem}
           pendingState={pendingState}
           rows={rows}
@@ -872,6 +903,7 @@ const BrowseList = memo(function BrowseList({
   loadingMore,
   media,
   onAction,
+  onRetryLoadMore,
   onSelect,
   pendingState,
   rows,
@@ -888,6 +920,7 @@ const BrowseList = memo(function BrowseList({
   loadingMore: boolean;
   media: string;
   onAction: (action: BrowseListAction, item: Item) => void;
+  onRetryLoadMore: () => void;
   onSelect: (event: MouseEvent<HTMLAnchorElement>, item: Item, href: string) => void;
   pendingState: string;
   rows: Item[];
@@ -915,7 +948,20 @@ const BrowseList = memo(function BrowseList({
         <div className="placeholder">{activeQuery ? "当前搜索没有匹配条目。" : "当前范围没有条目。"}</div>
       )}
       <div className="list-footer" ref={loadMoreRef}>
-        {loadingMore ? "正在加载..." : loadError || (!hasMore && rows.length ? "没有更多条目" : "")}
+        {loadingMore ? (
+          "正在加载..."
+        ) : loadError ? (
+          <>
+            {loadError}{" "}
+            <button className="list-footer-retry" onClick={onRetryLoadMore} type="button">
+              重试
+            </button>
+          </>
+        ) : !hasMore && rows.length ? (
+          "没有更多条目"
+        ) : (
+          ""
+        )}
       </div>
     </div>
   );
@@ -1044,7 +1090,6 @@ export function selectBrowseDetailAfterListLoad<T extends { id: number }>(rows: 
 
 function filterLabel(filter: string) {
   if (filter === "starred") return "收藏";
-  if (filter === "read_later") return "稍后";
   if (filter === "dismissed") return "忽略";
   if (filter === "") return "全部";
   return "未读";

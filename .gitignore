@@ -9,6 +9,15 @@ build/
 coverage/
 *.tsbuildinfo
 *.db
+*.sqlite
+*.sqlite3
+*.dump
+*.bak
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
 
 .venv/
 __pycache__/
@@ -17,3 +26,5 @@ __pycache__/
 
 .DS_Store
 .claude/
+xcuserdata/
+*.xcuserstate

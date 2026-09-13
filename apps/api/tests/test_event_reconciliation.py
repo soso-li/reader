@@ -169,7 +169,7 @@ def test_mutually_unique_member_add_continues_event_and_appends_one_revision() -
             event_id=event.id,
             seen_revision_id=initial_revision.id,
             read_status="summary_seen",
-            read_later=True,
+            read_later=False,
             starred=True,
         )
         session.add(state)
@@ -218,7 +218,7 @@ def test_mutually_unique_member_add_continues_event_and_appends_one_revision() -
         assert state.seen_revision_id == initial_revision.id
         assert (state.read_status, state.read_later, state.starred) == (
             "summary_seen",
-            True,
+            False,
             True,
         )
         assert session.scalar(select(func.count(InteractionEvent.id))) == 0
@@ -497,7 +497,7 @@ def test_one_parent_to_two_children_creates_new_split_events() -> None:
             event_id=original_event.id,
             seen_revision_id=original_revision.id,
             read_status="summary_seen",
-            read_later=True,
+            read_later=False,
             starred=True,
             uninterested=True,
             uninterested_reason="topic",
@@ -640,15 +640,15 @@ def test_one_parent_to_two_children_creates_new_split_events() -> None:
         reused_child = listed_by_id[original_cluster.id]
         assert reused_child["event_uid"] != original_event.uid
         assert reused_child["read_status"] == "unread"
-        assert reused_child["read_later"] is False
         assert reused_child["starred"] is False
+        assert "read_later" not in reused_child
         assert reused_child["uninterested"] is False
 
         detail = client.get(f"/clusters/{original_cluster.id}")
         assert detail.status_code == 200
         assert detail.json()["read_status"] == "unread"
-        assert detail.json()["read_later"] is False
         assert detail.json()["starred"] is False
+        assert "read_later" not in detail.json()
 
         assert client.get("/clusters", params={"starred": True}).json() == []
         assert client.get("/clusters/count", params={"starred": True}).json() == {
@@ -687,7 +687,7 @@ def test_one_parent_to_two_children_creates_new_split_events() -> None:
         assert rejected_parent_write.status_code == 409
         session.refresh(state)
         assert state.read_status == "summary_seen"
-        assert state.read_later is True
+        assert state.read_later is False
         assert state.starred is True
 
         split_cluster_ids = [original_cluster.id, duplicate_cluster.id]
@@ -818,8 +818,8 @@ def test_two_parents_to_one_child_creates_new_stateless_merge_event() -> None:
                     event_id=parent_mappings[0].event_id,
                     seen_revision_id=parent_mappings[0].event_revision_id,
                     read_status="summary_seen",
-                    read_later=True,
-                    starred=False,
+                    read_later=False,
+                    starred=True,
                     uninterested=True,
                     uninterested_reason="repetitive",
                     uninterested_at=datetime(
@@ -967,14 +967,14 @@ def test_two_parents_to_one_child_creates_new_stateless_merge_event() -> None:
         }[first_cluster.id]
         assert merged_row["event_uid"] == merged_event.uid
         assert merged_row["read_status"] == "unread"
-        assert merged_row["read_later"] is False
         assert merged_row["starred"] is False
+        assert "read_later" not in merged_row
         assert merged_row["uninterested"] is False
         detail = client.get(f"/clusters/{first_cluster.id}")
         assert detail.status_code == 200
         assert detail.json()["read_status"] == "unread"
-        assert detail.json()["read_later"] is False
         assert detail.json()["starred"] is False
+        assert "read_later" not in detail.json()
         assert first_cluster.id not in {
             row["id"]
             for row in client.get(
@@ -1383,7 +1383,7 @@ def test_no_anchor_replacement_creates_new_ambiguous_event_without_false_lineage
                 event_id=original_event.id,
                 seen_revision_id=original_mapping.event_revision_id,
                 read_status="summary_seen",
-                read_later=True,
+                read_later=False,
                 starred=True,
                 uninterested=True,
                 uninterested_reason="promotion",
@@ -1437,8 +1437,8 @@ def test_no_anchor_replacement_creates_new_ambiguous_event_without_false_lineage
         row = client.get(f"/clusters/{cluster.id}").json()
         assert row["event_uid"] != original_event.uid
         assert row["read_status"] == "unread"
-        assert row["read_later"] is False
         assert row["starred"] is False
+        assert "read_later" not in row
         assert row["uninterested"] is False
 
         ambiguous_event = session.get(Event, mapping.event_id)
@@ -1487,8 +1487,8 @@ def test_no_anchor_replacement_creates_new_ambiguous_event_without_false_lineage
         assert continuation.event_id == ambiguous_event.id
         continued_row = client.get(f"/clusters/{cluster.id}").json()
         assert continued_row["read_status"] == "unread"
-        assert continued_row["read_later"] is False
         assert continued_row["starred"] is True
+        assert "read_later" not in continued_row
 
 
 def test_partial_member_split_never_selects_a_main_child() -> None:
@@ -1961,7 +1961,7 @@ def test_many_to_many_overlap_creates_stateless_ambiguous_graph_and_replays() ->
                 event_id=mapping.event_id,
                 seen_revision_id=mapping.event_revision_id,
                 read_status="summary_seen",
-                read_later=True,
+                read_later=False,
                 starred=True,
             )
             for mapping in parent_mappings

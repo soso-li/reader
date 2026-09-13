@@ -34,6 +34,10 @@ import {
   type EventUserStateMutationResult
 } from "./event-user-state";
 import {
+  createScrollMarkCollector,
+  type ScrollMarkCollector
+} from "./event-read-batch";
+import {
   clearEventReadErrorsAfterSuccess,
   detailEvidencePresented,
   detailSummarySeenAllowed,
@@ -95,7 +99,6 @@ type Item = {
   url: string;
   published_at: string | null;
   read_status: string;
-  read_later: boolean;
   starred: boolean;
   filtered: boolean;
   filter_rules: string[];
@@ -115,7 +118,6 @@ type Cluster = ClusterEventIdentity & ClusterSynthesisFields & {
   last_seen_at: string | null;
   item_count: number;
   read_status: string;
-  read_later: boolean;
   starred: boolean;
   items?: Item[];
   source_view_evidence?: SourceViewEvidence[];
@@ -123,14 +125,15 @@ type Cluster = ClusterEventIdentity & ClusterSynthesisFields & {
 
 type ClusterImage = { url: string; alt: string; sources: string[] };
 type DetailMode = "synthesis" | "source";
+type EventReadTransport = "single" | "batch";
+const UNREAD_COUNT_REFRESH_DEBOUNCE_MS = 1000;
 type Scope = Record<string, string | number | null | undefined>;
 type ListRange = { folderId: number | null; sourceId: number | null };
-type EventStateField = "starred" | "read_later";
+type EventStateField = "starred";
 type ClusterStatePatch = Partial<
   Pick<
     Cluster,
     | "read_status"
-    | "read_later"
     | "starred"
     | "seen_revision_uid"
     | "current_revision_differs_from_seen"
@@ -212,6 +215,11 @@ export default function ClusterView({
   const eventReadQueueRef = useRef<Map<number, Promise<void>>>(new Map());
   const eventReadLatestRef = useRef<Map<number, EventReadOperation>>(new Map());
   const eventReadConfirmedRef = useRef<Map<number, ConfirmedReadState>>(new Map());
+  const scrollMarkCollectorRef = useRef<ScrollMarkCollector | null>(null);
+  if (scrollMarkCollectorRef.current === null) {
+    scrollMarkCollectorRef.current = createScrollMarkCollector();
+  }
+  const unreadDeltaQueueRef = useRef({ dispatch: 0, filterCount: 0, scheduled: false });
   const uninterestedRemovedRef = useRef<Map<number, {
     cluster: Cluster;
     listIndex: number;
@@ -485,6 +493,12 @@ export default function ClusterView({
   }, []);
 
   useEffect(() => {
+    const onPagehide = () => scrollMarkCollectorRef.current?.flushOnPagehide();
+    window.addEventListener("pagehide", onPagehide);
+    return () => window.removeEventListener("pagehide", onPagehide);
+  }, []);
+
+  useEffect(() => {
     if (selectedId === null || selectedDetailReady) return;
     const controller = new AbortController();
     const requestId = ++detailRequestId.current;
@@ -651,7 +665,7 @@ export default function ClusterView({
     try {
       mutation = createEventUserStateMutation(
         cluster,
-        field === "starred" ? "starred_set" : "read_later_set",
+        "starred_set",
         value
       );
     } catch {
@@ -703,7 +717,8 @@ export default function ClusterView({
     cluster: Cluster,
     value: EventReadStatus,
     target: EventReadTarget,
-    errorSurface: EventReadErrorSurface = "detail"
+    errorSurface: EventReadErrorSurface = "detail",
+    transport: EventReadTransport = "single"
   ) {
     const operationId = createOperationId();
     const operation: EventReadOperation = {
@@ -753,16 +768,27 @@ export default function ClusterView({
       .then(async () => {
         let result: EventUserStateMutationResult | undefined;
         try {
-          result = await sendEventUserStateMutation(mutation, { beacon: false });
-        } catch {
+          result =
+            transport === "batch"
+              ? await scrollMarkCollectorRef.current?.enqueue({
+                  event_uid: mutation.event_uid,
+                  observed_revision_uid: mutation.observed_revision_uid,
+                  operation_id: mutation.operation_id
+                })
+              : await sendEventUserStateMutation(mutation, { beacon: false });
+        } catch (error) {
           const latest = eventReadLatestRef.current.get(clusterId);
           if (latest?.operationId === operation.operationId) {
             const confirmed = eventReadConfirmedRef.current.get(clusterId);
             if (confirmed) applyClusterPatch(clusterId, confirmed);
           }
-          setEventReadErrors((current) =>
-            recordEventReadFailure(current, operation, latest)
-          );
+          const silentAbort =
+            error instanceof DOMException && error.name === "AbortError";
+          if (!silentAbort) {
+            setEventReadErrors((current) =>
+              recordEventReadFailure(current, operation, latest)
+            );
+          }
           return;
         }
         if (!result || result.action !== "read_status_set") return;
@@ -771,14 +797,10 @@ export default function ClusterView({
         eventReadConfirmedRef.current.set(clusterId, confirmed);
         if (previousConfirmed) {
           const delta = effectiveUnreadCountDelta(previousConfirmed, confirmed);
-          if (delta !== 0) {
-            if (unreadFilterAtStart && listRequestAtStart === listRequestId.current) {
-              setActiveFilterCount((current) =>
-                current === null ? null : Math.max(0, current + delta)
-              );
-            }
-            dispatchReaderUnreadCountChanged(delta);
-          }
+          queueUnreadCountDelta(
+            delta,
+            unreadFilterAtStart && listRequestAtStart === listRequestId.current
+          );
         }
         setEventReadErrors((current) =>
           clearEventReadErrorsAfterSuccess(current, operation)
@@ -798,6 +820,28 @@ export default function ClusterView({
         }
       });
     eventReadQueueRef.current.set(clusterId, task);
+  }
+
+  function queueUnreadCountDelta(delta: number, patchFilterCount: boolean) {
+    if (delta === 0) return;
+    const queue = unreadDeltaQueueRef.current;
+    queue.dispatch += delta;
+    if (patchFilterCount) queue.filterCount += delta;
+    if (queue.scheduled) return;
+    queue.scheduled = true;
+    queueMicrotask(() => {
+      const dispatchDelta = queue.dispatch;
+      const filterDelta = queue.filterCount;
+      queue.dispatch = 0;
+      queue.filterCount = 0;
+      queue.scheduled = false;
+      if (filterDelta !== 0) {
+        setActiveFilterCount((current) =>
+          current === null ? null : Math.max(0, current + filterDelta)
+        );
+      }
+      if (dispatchDelta !== 0) dispatchReaderUnreadCountChanged(dispatchDelta);
+    });
   }
 
   function scheduleUnreadCountRefresh() {
@@ -823,7 +867,7 @@ export default function ClusterView({
             unreadCountAbortController.current = null;
           }
         });
-    }, 200);
+    }, UNREAD_COUNT_REFRESH_DEBOUNCE_MS);
   }
 
   function applyClusterPatch(clusterId: number, patch: ClusterStatePatch) {
@@ -859,7 +903,8 @@ export default function ClusterView({
         cluster,
         intent,
         target,
-        trigger === "scroll_past" ? "list" : "detail"
+        trigger === "scroll_past" ? "list" : "detail",
+        trigger === "scroll_past" ? "batch" : "single"
       );
     }
   }
@@ -987,11 +1032,6 @@ export default function ClusterView({
     updateEventState("starred", !selectedCluster.starred, "star");
   }
 
-  function toggleReadLater() {
-    if (!selectedCluster) return;
-    updateEventState("read_later", !selectedCluster.read_later, "read-later");
-  }
-
   function openOriginal() {
     const item = selectedSourceItem ?? sourceItems[0];
     if (!item?.url) return;
@@ -1080,7 +1120,6 @@ export default function ClusterView({
       if (key === "o") openOriginal();
       if (key === "m") toggleReadStatus();
       if (key === "s") toggleStar();
-      if (key === "l") toggleReadLater();
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -1091,8 +1130,7 @@ export default function ClusterView({
   const toolbarActions = selectedCluster
     ? ([
         { id: "read-toggle", label: readToggleLabel, node: <StateButton active={selectedIsSeen} disabled={eventPendingKeys.has(`${selectedCluster.id}:read-status`)} label={readToggleLabel} onClick={toggleReadStatus} /> },
-        { id: "read-later", label: "稍后读", node: <StateButton active={selectedCluster.read_later} disabled={eventPendingKeys.has(`${selectedCluster.id}:read-later`)} label="稍后阅读" onClick={toggleReadLater} /> },
-        { id: "star", label: "星标", node: <StateButton disabled={eventPendingKeys.has(`${selectedCluster.id}:star`)} icon object={selectedCluster} onClick={toggleStar} /> },
+        { id: "star", label: "收藏", node: <StateButton disabled={eventPendingKeys.has(`${selectedCluster.id}:star`)} icon object={selectedCluster} onClick={toggleStar} /> },
         selectedCluster.event_uid &&
         selectedCluster.synthesis &&
         synthesisRequestAvailable(selectedCluster.synthesis)
@@ -1484,7 +1522,6 @@ export default function ClusterView({
 
 function filterLabel(filter: string) {
   if (filter === "starred") return "收藏";
-  if (filter === "read_later") return "稍后读";
   if (filter === "unread") return "未读";
   if (filter === "dismissed") return "已忽略";
   return "全部";

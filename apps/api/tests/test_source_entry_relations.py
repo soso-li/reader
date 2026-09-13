@@ -128,7 +128,7 @@ def seed_duplicate_entries(
                 object_type="item",
                 object_id=duplicate_item.id,
                 read_status="summary_seen",
-                read_later=True,
+                read_later=False,
                 starred=True,
             ),
         ]

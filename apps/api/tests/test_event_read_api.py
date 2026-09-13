@@ -83,8 +83,8 @@ def seed_event_lifecycle() -> dict[str, object]:
                     event_id=event.id,
                     seen_revision_id=revision.id,
                     read_status="summary_seen",
-                    read_later=True,
-                    starred=False,
+                    read_later=False,
+                    starred=True,
                     updated_at=NOW,
                 ),
             ]
@@ -130,8 +130,7 @@ def test_event_lifecycle_survives_cluster_deletion() -> None:
         "material_update_revision_uid": None,
         "user_state": {
             "read_status": "summary_seen",
-            "read_later": True,
-            "starred": False,
+            "starred": True,
             "uninterested": False,
             "uninterested_reason": None,
             "uninterested_note": None,

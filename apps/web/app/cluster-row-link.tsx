@@ -18,7 +18,6 @@ type Props = {
   id: number;
   meta: ReactNode;
   objectType?: "topic";
-  readLater: boolean;
   readStatus: string;
   starred: boolean;
   summary: string;
@@ -30,7 +29,7 @@ type Props = {
   onSelect?: (event: MouseEvent<HTMLElement>) => void;
 };
 
-export default function ClusterRowLink({ active, apiUrl, href, id, meta, objectType, onSelect, readLater, readStatus, starred, sources = [], summary, thumbnailMode = "never", thumbnailUrl = "", title, titleTranslation = "" }: Props) {
+export default function ClusterRowLink({ active, apiUrl, href, id, meta, objectType, onSelect, readStatus, starred, sources = [], summary, thumbnailMode = "never", thumbnailUrl = "", title, titleTranslation = "" }: Props) {
   const followupSources = sources.slice(1);
   const showThumbnail = Boolean(thumbnailUrl && (thumbnailMode === "always" || thumbnailMode === "auto"));
 
@@ -71,7 +70,7 @@ export default function ClusterRowLink({ active, apiUrl, href, id, meta, objectT
                   {apiUrl ? <TranslatedTitle text={source.title || source.source_name || "无标题来源"} initialTranslation={source.title_translation || ""} /> : source.title || source.source_name || "无标题来源"}
                 </span>
                 <span className="cluster-followup-time">
-                  <TimeText value={source.published_at} />
+                  <TimeText interactive={false} value={source.published_at} />
                   收到
                 </span>
               </div>
@@ -81,8 +80,7 @@ export default function ClusterRowLink({ active, apiUrl, href, id, meta, objectT
       ) : null}
       <div className="badges">
         {readStatus === "dismissed" ? <span className="badge">忽略</span> : null}
-        {readLater ? <span className="badge">稍后</span> : null}
-        {starred ? <span className="badge">星标</span> : null}
+        {starred ? <span className="badge">收藏</span> : null}
       </div>
     </>
   );

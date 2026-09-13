@@ -1,11 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { loadBrowseList, loadClusterCount, loadClusterList, normalizeListFilter } from "./list-api.ts";
+import { listFilterQuery, loadBrowseList, loadClusterCount, loadClusterList, normalizeListFilter } from "./list-api.ts";
 
 test("list filter normalization preserves the explicit all state", () => {
   assert.equal(normalizeListFilter("all"), "");
   assert.equal(normalizeListFilter(null), "unread");
+  assert.equal(normalizeListFilter("read_later"), "starred");
+  assert.deepEqual(listFilterQuery("read_later"), {
+    read_status: undefined,
+    starred: "true"
+  });
 });
 
 test("cluster list client loads rows and count from the current filter and search state", async () => {

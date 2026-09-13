@@ -41,7 +41,20 @@ CACHE_LOCK_RETRY_SECONDS = 0.01
 TRANSIENT_IMAGE_STATUSES = frozenset({429, 502, 503, 504})
 DEFAULT_CACHE_BYTES = 50 * 1024 * 1024 * 1024
 DEFAULT_CACHE_DIRECTORY = "/tmp/reader-article-images"
+DEFAULT_IMAGE_FAILURE_RETRY_SECONDS = 24 * 60 * 60
 REFERER_ATTEMPT = "source-referer-v2"
+
+
+def image_failure_retry_seconds() -> int:
+    try:
+        return int(
+            os.getenv(
+                "READER_IMAGE_FAILURE_RETRY_SECONDS",
+                str(DEFAULT_IMAGE_FAILURE_RETRY_SECONDS),
+            )
+        )
+    except ValueError:
+        return DEFAULT_IMAGE_FAILURE_RETRY_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,7 +158,13 @@ class ArticleImageCache:
             attempted = metadata.get("proxy_attempted")
             if attempted is True and _image_referer(str(metadata.get("url") or "")):
                 return False
-            return bool(attempted)
+            if not attempted:
+                return False
+            attempted_at = metadata.get("proxy_attempted_at")
+            # 无时间戳的遗留失败标记按已过期处理，允许一次重试后带时间戳重标。
+            if not isinstance(attempted_at, (int, float)):
+                return False
+            return time.time() - attempted_at < image_failure_retry_seconds()
 
     def mark_proxy_attempted(self, url: str) -> None:
         key = cache_key_for_url(url)
@@ -161,6 +180,7 @@ class ArticleImageCache:
                     "proxy_attempted": (
                         REFERER_ATTEMPT if _image_referer(url) else True
                     ),
+                    "proxy_attempted_at": time.time(),
                 },
             )
 

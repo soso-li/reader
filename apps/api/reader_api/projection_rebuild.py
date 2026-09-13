@@ -8,7 +8,9 @@ from sqlalchemy.orm import Session
 from .feed_metrics import refresh_source_trust_score
 from .models import (
     ContentItem,
+    EventEvidenceVersion,
     EventRevision,
+    EventRevisionEvidence,
     EventUserState,
     FeedMetric,
     InteractionEvent,
@@ -166,6 +168,17 @@ def _expected_projections(
         revision.id: (revision.event_id, revision.revision_no)
         for revision in session.scalars(select(EventRevision)).all()
     }
+    revision_sources: dict[int, list[int]] = {}
+    for revision_id, source_id in session.execute(
+        select(
+            EventRevisionEvidence.revision_id,
+            EventEvidenceVersion.source_id,
+        ).join(
+            EventEvidenceVersion,
+            EventEvidenceVersion.id == EventRevisionEvidence.evidence_version_id,
+        )
+    ):
+        revision_sources.setdefault(revision_id, []).append(source_id)
     event_states: dict[int, dict[str, object]] = {}
     object_states: dict[tuple[str, int], dict[str, object]] = {}
 
@@ -196,6 +209,9 @@ def _expected_projections(
                 read_status=baseline.read_status,
                 read_later=baseline.read_later,
                 starred=baseline.starred,
+                baseline_sources=revision_sources.get(
+                    baseline.resolved_revision_id, []
+                ),
                 updated_at=baseline.source_updated_at,
             )
             if state["seen_revision_id"] is not None:
@@ -271,26 +287,31 @@ def _event_state(
     read_status: str = "unread",
     read_later: bool = False,
     starred: bool = False,
+    baseline_sources: list[int] | None = None,
     uninterested: bool = False,
     uninterested_reason: str | None = None,
     uninterested_note: str | None = None,
     uninterested_at: datetime | None = None,
     updated_at: datetime,
 ) -> dict[str, object]:
+    sources = sorted(set(baseline_sources or []))
     return {
         "baseline_id": baseline_id,
         "seen_revision_id": seen_revision_id,
         "read_status": read_status,
-        "read_later": read_later,
-        "starred": starred,
+        "read_later": False,
+        "starred": starred or read_later,
+        "legacy_read_later": read_later,
+        "legacy_starred": starred,
         "uninterested": uninterested,
         "uninterested_reason": uninterested_reason,
         "uninterested_note": uninterested_note,
         "uninterested_at": uninterested_at,
         "updated_at": updated_at,
         "seen_revision_no": None,
-        "starred_sources": [],
-        "read_later_sources": [],
+        "starred_sources": sources if starred or read_later else [],
+        "legacy_starred_sources": sources if starred else [],
+        "legacy_read_later_sources": sources if read_later else [],
         "read_sources": [],
         "opened_sources": [],
     }
@@ -310,8 +331,10 @@ def _object_state(
 ) -> dict[str, object]:
     return {
         "read_status": read_status,
-        "read_later": read_later,
-        "starred": starred,
+        "read_later": False,
+        "starred": starred or read_later,
+        "legacy_read_later": read_later,
+        "legacy_starred": starred,
         "uninterested": uninterested,
         "uninterested_reason": uninterested_reason,
         "uninterested_note": uninterested_note,
@@ -332,13 +355,36 @@ def _apply_event_interaction(
     if interaction.action in {"starred_set", "read_later_set"}:
         if not isinstance(interaction.set_value, bool):
             raise RuntimeError(f"Event set value 非布尔值：{interaction.id}")
-        field = "starred" if interaction.action == "starred_set" else "read_later"
         sources = _payload_source_ids(payload, "metric_source_ids", interaction.id)
         _validate_sources(sources, source_ids, interaction.id)
         if not interaction.set_value and sources:
             raise RuntimeError(f"Event false set 仍含指标来源：{interaction.id}")
-        state[field] = interaction.set_value
-        state[f"{field}_sources"] = sources
+        if payload.get("saved_semantics") == "unified":
+            state["legacy_starred"] = interaction.set_value
+            state["legacy_read_later"] = False
+            state["legacy_starred_sources"] = sources
+            state["legacy_read_later_sources"] = []
+        else:
+            field = (
+                "legacy_starred"
+                if interaction.action == "starred_set"
+                else "legacy_read_later"
+            )
+            state[field] = interaction.set_value
+            state[f"{field}_sources"] = sources
+        state["starred"] = bool(
+            state["legacy_starred"] or state["legacy_read_later"]
+        )
+        state["read_later"] = False
+        state["starred_sources"] = sorted(
+            set(
+                (state["legacy_starred_sources"] if state["legacy_starred"] else [])
+            ).union(
+                state["legacy_read_later_sources"]
+                if state["legacy_read_later"]
+                else []
+            )
+        )
     elif interaction.action == "read_status_set":
         if interaction.set_value not in {"unread", "summary_seen", "original_opened"}:
             raise RuntimeError(f"Event read status 非法：{interaction.id}")
@@ -383,8 +429,20 @@ def _apply_object_interaction(
     elif interaction.action in {"starred_set", "read_later_set"}:
         if not isinstance(interaction.set_value, bool):
             raise RuntimeError(f"对象 set value 非布尔值：{interaction.id}")
-        field = "starred" if interaction.action == "starred_set" else "read_later"
-        state[field] = interaction.set_value
+        if payload.get("saved_semantics") == "unified":
+            state["legacy_starred"] = interaction.set_value
+            state["legacy_read_later"] = False
+        else:
+            field = (
+                "legacy_starred"
+                if interaction.action == "starred_set"
+                else "legacy_read_later"
+            )
+            state[field] = interaction.set_value
+        state["starred"] = bool(
+            state["legacy_starred"] or state["legacy_read_later"]
+        )
+        state["read_later"] = False
     elif interaction.action == "uninterested_set":
         _apply_uninterested_interaction(state, interaction, payload)
     else:
@@ -469,8 +527,6 @@ def _metric_counts(
             increment(int(source_id), "opened_count")
         for source_id in state["starred_sources"]:
             increment(int(source_id), "starred_count")
-        for source_id in state["read_later_sources"]:
-            increment(int(source_id), "read_later_count")
 
     for (object_type, _object_id), state in object_states.items():
         if object_type != "item":
@@ -479,7 +535,6 @@ def _metric_counts(
         contributes = (
             state["read_status"] in SEEN_READ_STATUSES
             or bool(state["starred"])
-            or bool(state["read_later"])
         )
         if source_id is None:
             if contributes:
@@ -491,8 +546,6 @@ def _metric_counts(
             increment(int(source_id), "opened_count")
         if bool(state["starred"]):
             increment(int(source_id), "starred_count")
-        if bool(state["read_later"]):
-            increment(int(source_id), "read_later_count")
     return counts
 
 

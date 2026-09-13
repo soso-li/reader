@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import re
@@ -610,6 +611,31 @@ def _assign_block_ids(root: etree._Element) -> None:
         occurrences[key] = occurrence + 1
         digest = hashlib.sha256(f"{key}\0{occurrence}".encode()).hexdigest()[:16]
         element.set("data-reader-block-id", f"block-{digest}")
+
+
+def translation_blocks_from_reading_html(value: str) -> list[tuple[str, str]]:
+    try:
+        root = html.fragment_fromstring(value, create_parent="div")
+    except (etree.ParserError, ValueError):
+        return []
+    blocks: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for element in root.xpath(".//*[@data-reader-block-id]"):
+        block_id = element.get("data-reader-block-id", "")
+        if not re.fullmatch(r"block-[0-9a-f]{16}", block_id) or block_id in seen:
+            return []
+        seen.add(block_id)
+        if _local_tag(element) in {"pre", "code"}:
+            continue
+        clone = deepcopy(element)
+        for excluded in clone.xpath(
+            ".//*[@data-reader-block-id] | .//pre | .//code"
+        ):
+            excluded.drop_tree()
+        text = _TRANSLATABLE_SPACE_RE.sub(" ", "".join(clone.itertext())).strip()
+        if text:
+            blocks.append((block_id, text))
+    return blocks
 
 
 def _render_container(element: etree._Element) -> str:

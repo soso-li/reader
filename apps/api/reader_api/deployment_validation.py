@@ -28,7 +28,6 @@ from .isolated_stage_target import (
     dedicated_stage_policy_for_database,
 )
 from .production_target import (
-    KNOWN_PRODUCTION_HOSTS,
     credential_secrets,
     production_target_identity,
     sanitized_exception_message,
@@ -178,6 +177,8 @@ P02_PROJECTION_TABLES = (
 )
 P02_PROJECTION_IGNORED_COLUMNS = {
     "events": ("current_synthesis_version_id", "reviewed_evidence_review_id"),
+    # 0074 adds a nullable presentation snapshot without rewriting Event facts.
+    "event_evidence_versions": ("reading_html_snapshot",),
     # These columns do not exist before 0070. Projection verify protects their
     # values before and after deployment; the migration manifest stays
     # comparable across the additive schema change.
@@ -256,6 +257,14 @@ EVENT_AUTHORITY_MIN_REVISION = 47
 SOURCE_GENERATION_PRIVACY_MIN_REVISION = 55
 SOURCE_GENERATION_PRIVACY_REVIEWED_THROUGH_REVISION = 71
 READING_BODY_CONTRACT_REVISION = 72
+UNIFIED_SAVED_STATE_EVIDENCE_START_REVISION = 72
+UNIFIED_SAVED_STATE_REVISION = 73
+UNIFIED_SAVED_STATE_EVIDENCE_TABLES = (
+    "event_user_states",
+    "user_states",
+    "feed_metrics",
+    "sources",
+)
 READING_BODY_CONTRACT_EVIDENCE_COUNTS = {
     "source_selectors_all_null_count": "sources",
     "document_body_all_null_count": "documents",
@@ -274,6 +283,7 @@ class DatabaseTarget:
     port: int
     database: str
     username: str
+    known_production_host: bool
     production_authorized: bool
     maintenance_id: str
 
@@ -296,8 +306,9 @@ def database_target(
     environ: Mapping[str, str] | None = None,
 ) -> DatabaseTarget:
     """Parse a PostgreSQL target and require three explicit production signals."""
+    environment = os.environ if environ is None else environ
     try:
-        identity = production_target_identity(database_url)
+        identity = production_target_identity(database_url, environ=environment)
     except Exception as exc:
         raise DatabaseSafetyError(str(exc)) from exc
     url = identity.url
@@ -307,7 +318,6 @@ def database_target(
             "请使用明确的 host、port 与 database"
         )
 
-    environment = os.environ if environ is None else environ
     production_authorized = identity.is_authorized(
         command_confirmed=production_maintenance,
         authorization_env=PRODUCTION_AUTH_ENV,
@@ -328,6 +338,7 @@ def database_target(
         port=identity.port,
         database=identity.database,
         username=identity.username,
+        known_production_host=identity.known_production_host,
         production_authorized=production_authorized,
         maintenance_id=maintenance_id if production_authorized else "",
     )
@@ -335,7 +346,7 @@ def database_target(
 
 def validate_rehearsal_target(target: DatabaseTarget) -> DatabaseTarget:
     """Require an unmistakably disposable target before external rehearsal steps."""
-    if target.host in KNOWN_PRODUCTION_HOSTS or target.production_authorized:
+    if target.known_production_host or target.production_authorized:
         raise DatabaseSafetyError("演练数据库必须与生产 PostgreSQL host 完全隔离")
     _reject_dedicated_stage_database(target.database)
     if len(target.database) > 63 or not REHEARSAL_DATABASE_RE.fullmatch(
@@ -965,6 +976,43 @@ def _validated_snapshot(manifest: Mapping[str, object]) -> Mapping[str, object]:
                     "database-manifest reading_body_contract_evidence."
                     f"{field_name} 无效"
                 )
+    unified_saved_evidence = snapshot.get("unified_saved_state_evidence")
+    requires_unified_saved_evidence = (
+        revision_ordinal is not None
+        and revision_ordinal >= UNIFIED_SAVED_STATE_EVIDENCE_START_REVISION
+    )
+    if requires_unified_saved_evidence and not isinstance(
+        unified_saved_evidence, Mapping
+    ):
+        raise EvidenceError(
+            "database-manifest 0072+ 缺少 unified_saved_state_evidence"
+        )
+    if not requires_unified_saved_evidence and unified_saved_evidence is not None:
+        raise EvidenceError(
+            "database-manifest unified_saved_state_evidence 与 Alembic 阶段不一致"
+        )
+    if isinstance(unified_saved_evidence, Mapping):
+        if set(unified_saved_evidence) != set(
+            UNIFIED_SAVED_STATE_EVIDENCE_TABLES
+        ):
+            raise EvidenceError(
+                "database-manifest unified saved 表集合不完整"
+            )
+        for table in UNIFIED_SAVED_STATE_EVIDENCE_TABLES:
+            table_evidence = unified_saved_evidence[table]
+            if not isinstance(table_evidence, Mapping) or set(table_evidence) != {
+                "actual",
+                "normalized",
+            }:
+                raise EvidenceError(
+                    f"database-manifest unified saved {table} 字段不完整"
+                )
+            for view in ("actual", "normalized"):
+                validate_table_evidence_rows(
+                    f"unified_saved_state_evidence.{table}.{view}",
+                    {table: table_evidence[view]},
+                    (table,),
+                )
     preserved_evidence = snapshot.get("preserved_table_evidence")
     projection_evidence = snapshot.get("p02_projection_evidence")
     runtime_user_state_evidence = snapshot.get(
@@ -1102,6 +1150,12 @@ def compare_database_manifests(
     after_revision_ordinal = _highest_revision_ordinal(
         after_snapshot["alembic_revisions"]
     )
+    crossed_unified_saved_state_revision = (
+        before_revision_ordinal is not None
+        and before_revision_ordinal < UNIFIED_SAVED_STATE_REVISION
+        and after_revision_ordinal is not None
+        and after_revision_ordinal >= UNIFIED_SAVED_STATE_REVISION
+    )
     compare_runtime_user_state_count = bool(
         before_revision_ordinal is not None
         and before_revision_ordinal >= EVENT_AUTHORITY_MIN_REVISION
@@ -1145,6 +1199,11 @@ def compare_database_manifests(
             assert isinstance(before_runtime_table, Mapping)
             assert isinstance(after_runtime_table, Mapping)
             for field_name in ("row_count", "ordered_rows_sha256"):
+                if (
+                    field_name == "ordered_rows_sha256"
+                    and crossed_unified_saved_state_revision
+                ):
+                    continue
                 if before_runtime_table.get(
                     field_name
                 ) != after_runtime_table.get(field_name):
@@ -1200,6 +1259,12 @@ def compare_database_manifests(
         assert isinstance(before_table, Mapping)
         assert isinstance(after_table, Mapping)
         for field_name in ("columns", "row_count", "ordered_rows_sha256"):
+            if (
+                table == "sources"
+                and field_name == "ordered_rows_sha256"
+                and crossed_unified_saved_state_revision
+            ):
+                continue
             if before_table.get(field_name) != after_table.get(field_name):
                 mismatches.append(
                     {
@@ -1339,6 +1404,12 @@ def compare_database_manifests(
             assert isinstance(after_table, Mapping)
             for field_name in ("row_count", "ordered_rows_sha256"):
                 if (
+                    table == "sources"
+                    and field_name == "ordered_rows_sha256"
+                    and crossed_unified_saved_state_revision
+                ):
+                    continue
+                if (
                     table in {"sources", "documents"}
                     and field_name == "ordered_rows_sha256"
                     and crossed_reading_body_contract_revision
@@ -1438,6 +1509,12 @@ def compare_database_manifests(
             assert isinstance(before_table, Mapping)
             assert isinstance(after_table, Mapping)
             for field_name in ("row_count", "ordered_rows_sha256"):
+                if (
+                    table == "event_user_states"
+                    and field_name == "ordered_rows_sha256"
+                    and crossed_unified_saved_state_revision
+                ):
+                    continue
                 if before_table.get(field_name) != after_table.get(field_name):
                     mismatches.append(
                         {
@@ -1448,6 +1525,67 @@ def compare_database_manifests(
                             "after": after_table.get(field_name),
                         }
                     )
+    before_unified_saved = before_snapshot.get("unified_saved_state_evidence")
+    after_unified_saved = after_snapshot.get("unified_saved_state_evidence")
+    if crossed_unified_saved_state_revision and not (
+        isinstance(before_unified_saved, Mapping)
+        and isinstance(after_unified_saved, Mapping)
+    ):
+        mismatches.append(
+            {
+                "field": "unified_saved_state_evidence",
+                "before": isinstance(before_unified_saved, Mapping),
+                "after": isinstance(after_unified_saved, Mapping),
+            }
+        )
+    elif isinstance(before_unified_saved, Mapping) and isinstance(
+        after_unified_saved, Mapping
+    ):
+        for table in UNIFIED_SAVED_STATE_EVIDENCE_TABLES:
+            before_table = before_unified_saved[table]
+            after_table = after_unified_saved[table]
+            assert isinstance(before_table, Mapping)
+            assert isinstance(after_table, Mapping)
+            views = ("normalized",) if crossed_unified_saved_state_revision else (
+                "actual",
+                "normalized",
+            )
+            for view in views:
+                before_view = before_table[view]
+                after_view = after_table[view]
+                assert isinstance(before_view, Mapping)
+                assert isinstance(after_view, Mapping)
+                for field_name in ("row_count", "ordered_rows_sha256"):
+                    if before_view.get(field_name) != after_view.get(field_name):
+                        mismatches.append(
+                            {
+                                "field": (
+                                    "unified_saved_state_evidence."
+                                    f"{table}.{view}.{field_name}"
+                                ),
+                                "before": before_view.get(field_name),
+                                "after": after_view.get(field_name),
+                            }
+                        )
+            if crossed_unified_saved_state_revision:
+                after_actual = after_table["actual"]
+                after_normalized = after_table["normalized"]
+                assert isinstance(after_actual, Mapping)
+                assert isinstance(after_normalized, Mapping)
+                for field_name in ("row_count", "ordered_rows_sha256"):
+                    if after_actual.get(field_name) != after_normalized.get(
+                        field_name
+                    ):
+                        mismatches.append(
+                            {
+                                "field": (
+                                    "unified_saved_state_evidence."
+                                    f"{table}.actual.{field_name}"
+                                ),
+                                "before": after_normalized.get(field_name),
+                                "after": after_actual.get(field_name),
+                            }
+                        )
     before_p03 = before_snapshot.get("p03_migration_evidence")
     after_p03 = after_snapshot.get("p03_migration_evidence")
     if isinstance(before_p03, Mapping) and not isinstance(after_p03, Mapping):
@@ -2130,6 +2268,266 @@ def _collect_table_evidence(
     return evidence
 
 
+def _collect_unified_saved_state_evidence(connection: Any) -> dict[str, object]:
+    evidence: dict[str, object] = {}
+    for table in ("event_user_states", "user_states"):
+        rows = list(
+            connection.execute(
+                text(
+                    f'SELECT id, to_jsonb(row_value)::text AS actual_json, '
+                    f"(to_jsonb(row_value) || jsonb_build_object("
+                    f"'read_later', false, 'starred', starred OR read_later))::text "
+                    f'AS normalized_json FROM "{table}" AS row_value ORDER BY id'
+                )
+            ).mappings()
+        )
+        evidence[table] = {
+            "actual": build_table_evidence(
+                (row["id"], row["actual_json"]) for row in rows
+            ),
+            "normalized": build_table_evidence(
+                (row["id"], row["normalized_json"]) for row in rows
+            ),
+        }
+
+    saved_counts_ctes = """
+        unified_ranked AS (
+            SELECT interaction.event_id, interaction.set_value,
+                   interaction.payload,
+                   row_number() OVER (
+                       PARTITION BY interaction.event_id
+                       ORDER BY interaction.recorded_at DESC,
+                                interaction.id DESC
+                   ) AS position
+            FROM interaction_events AS interaction
+            WHERE interaction.target_kind = 'event'
+              AND interaction.action IN ('starred_set', 'read_later_set')
+              AND interaction.payload ->> 'saved_semantics' = 'unified'
+        ),
+        latest_unified AS (
+            SELECT event_id, set_value, payload
+            FROM unified_ranked
+            WHERE position = 1
+        ),
+        legacy_ranked AS (
+            SELECT interaction.event_id, interaction.action,
+                   interaction.set_value, interaction.payload,
+                   row_number() OVER (
+                       PARTITION BY interaction.event_id, interaction.action
+                       ORDER BY interaction.recorded_at DESC,
+                                interaction.id DESC
+                   ) AS position
+            FROM interaction_events AS interaction
+            WHERE interaction.target_kind = 'event'
+              AND interaction.action IN ('starred_set', 'read_later_set')
+              AND COALESCE(
+                    interaction.payload ->> 'saved_semantics', ''
+                  ) <> 'unified'
+        ),
+        latest_legacy AS (
+            SELECT event_id, action, set_value, payload
+            FROM legacy_ranked
+            WHERE position = 1
+        ),
+        interaction_saved_sources AS (
+            SELECT unified.event_id, source_id.value::bigint AS source_id
+            FROM latest_unified AS unified
+            CROSS JOIN LATERAL json_array_elements_text(
+                unified.payload -> 'metric_source_ids'
+            ) AS source_id(value)
+            WHERE unified.set_value::jsonb = 'true'::jsonb
+            UNION ALL
+            SELECT legacy.event_id, source_id.value::bigint AS source_id
+            FROM latest_legacy AS legacy
+            CROSS JOIN LATERAL json_array_elements_text(
+                legacy.payload -> 'metric_source_ids'
+            ) AS source_id(value)
+            WHERE legacy.set_value::jsonb = 'true'::jsonb
+              AND NOT EXISTS (
+                  SELECT 1 FROM latest_unified AS unified
+                  WHERE unified.event_id = legacy.event_id
+              )
+        ),
+        baseline_saved_sources AS (
+            SELECT baseline.resolved_event_id AS event_id,
+                   version.source_id
+            FROM migration_baselines AS baseline
+            JOIN event_revision_evidence AS member
+              ON member.revision_id = baseline.resolved_revision_id
+            JOIN event_evidence_versions AS version
+              ON version.id = member.evidence_version_id
+            WHERE baseline.legacy_object_type = 'cluster'
+              AND NOT EXISTS (
+                  SELECT 1 FROM latest_unified AS unified
+                  WHERE unified.event_id = baseline.resolved_event_id
+              )
+              AND (
+                  (baseline.starred AND NOT EXISTS (
+                      SELECT 1 FROM latest_legacy AS legacy
+                      WHERE legacy.event_id = baseline.resolved_event_id
+                        AND legacy.action = 'starred_set'
+                  ))
+                  OR
+                  (baseline.read_later AND NOT EXISTS (
+                      SELECT 1 FROM latest_legacy AS legacy
+                      WHERE legacy.event_id = baseline.resolved_event_id
+                        AND legacy.action = 'read_later_set'
+                  ))
+              )
+        ),
+        saved_targets AS (
+            SELECT DISTINCT source_id, 'event'::text AS target_kind,
+                            event_id AS target_id
+            FROM (
+                SELECT event_id, source_id FROM interaction_saved_sources
+                UNION ALL
+                SELECT event_id, source_id FROM baseline_saved_sources
+            ) AS event_sources
+            UNION
+            SELECT item.source_id, 'item'::text AS target_kind,
+                   state.object_id AS target_id
+            FROM user_states AS state
+            JOIN content_items AS item
+              ON state.object_type = 'item' AND item.id = state.object_id
+            WHERE state.starred OR state.read_later
+        ),
+        saved_counts AS (
+            SELECT source_id, count(*) AS saved_count
+            FROM saved_targets
+            GROUP BY source_id
+        )
+    """
+    metric_rows = list(
+        connection.execute(
+            text(
+                f"""
+                WITH {saved_counts_ctes},
+                metric_sources AS (
+                    SELECT source_id FROM feed_metrics
+                    UNION
+                    SELECT source_id FROM saved_counts
+                )
+                SELECT ids.source_id AS row_id, metric.id AS metric_id,
+                       CASE WHEN metric.id IS NULL THEN NULL ELSE
+                         jsonb_build_object(
+                           'source_id', metric.source_id,
+                           'fetched_count', metric.fetched_count,
+                           'read_count', metric.read_count,
+                           'opened_count', metric.opened_count,
+                           'starred_count', metric.starred_count,
+                           'read_later_count', metric.read_later_count,
+                           'cluster_count', metric.cluster_count,
+                           'duplicate_count', metric.duplicate_count
+                         )::text END AS actual_json,
+                       jsonb_build_object(
+                         'source_id', ids.source_id,
+                         'fetched_count', COALESCE(metric.fetched_count, 0),
+                         'read_count', COALESCE(metric.read_count, 0),
+                         'opened_count', COALESCE(metric.opened_count, 0),
+                         'starred_count', COALESCE(saved.saved_count, 0),
+                         'read_later_count', 0,
+                         'cluster_count', COALESCE(metric.cluster_count, 0),
+                         'duplicate_count', COALESCE(metric.duplicate_count, 0)
+                       )::text AS normalized_json
+                FROM metric_sources AS ids
+                LEFT JOIN feed_metrics AS metric
+                  ON metric.source_id = ids.source_id
+                LEFT JOIN saved_counts AS saved
+                  ON saved.source_id = ids.source_id
+                ORDER BY ids.source_id
+                """
+            )
+        ).mappings()
+    )
+    evidence["feed_metrics"] = {
+        "actual": build_table_evidence(
+            (row["row_id"], row["actual_json"])
+            for row in metric_rows
+            if row["metric_id"] is not None
+        ),
+        "normalized": build_table_evidence(
+            (row["row_id"], row["normalized_json"]) for row in metric_rows
+        ),
+    }
+
+    source_rows = list(
+        connection.execute(
+            text(
+                f"""
+                WITH {saved_counts_ctes},
+                metric_sources AS (
+                    SELECT source_id FROM feed_metrics
+                    UNION
+                    SELECT source_id FROM saved_counts
+                ),
+                metric_projection AS (
+                    SELECT ids.source_id,
+                           COALESCE(metric.fetched_count, 0) AS fetched_count,
+                           COALESCE(metric.read_count, 0) AS read_count,
+                           COALESCE(metric.opened_count, 0) AS opened_count,
+                           COALESCE(saved.saved_count, 0) AS starred_count
+                    FROM metric_sources AS ids
+                    LEFT JOIN feed_metrics AS metric
+                      ON metric.source_id = ids.source_id
+                    LEFT JOIN saved_counts AS saved
+                      ON saved.source_id = ids.source_id
+                ),
+                cluster_sizes AS (
+                    SELECT cluster_id, count(*) AS item_count
+                    FROM cluster_items
+                    GROUP BY cluster_id
+                ),
+                source_topology AS (
+                    SELECT item.source_id,
+                           count(DISTINCT member.cluster_id) AS cluster_count,
+                           count(member.id) FILTER (
+                               WHERE cluster_sizes.item_count > 1
+                           ) AS duplicate_count
+                    FROM cluster_items AS member
+                    JOIN content_items AS item
+                      ON item.id = member.content_item_id
+                    JOIN cluster_sizes
+                      ON cluster_sizes.cluster_id = member.cluster_id
+                    GROUP BY item.source_id
+                ),
+                expected_trust AS (
+                    SELECT metric.source_id,
+                           LEAST(100.0, GREATEST(0.0, round((
+                               metric.read_count
+                               + metric.opened_count * 2
+                               + metric.starred_count * 3
+                               + COALESCE(topology.cluster_count, 0)
+                               - COALESCE(topology.duplicate_count, 0)
+                           ) * 100.0 / GREATEST(metric.fetched_count, 1), 1)))
+                           ::double precision AS score
+                    FROM metric_projection AS metric
+                    LEFT JOIN source_topology AS topology
+                      ON topology.source_id = metric.source_id
+                )
+                SELECT source.id, to_jsonb(source)::text AS actual_json,
+                       (to_jsonb(source) || jsonb_build_object(
+                           'feed_trust_score',
+                           COALESCE(expected.score, source.feed_trust_score)
+                       ))::text AS normalized_json
+                FROM sources AS source
+                LEFT JOIN expected_trust AS expected
+                  ON expected.source_id = source.id
+                ORDER BY source.id
+                """
+            )
+        ).mappings()
+    )
+    evidence["sources"] = {
+        "actual": build_table_evidence(
+            (row["id"], row["actual_json"]) for row in source_rows
+        ),
+        "normalized": build_table_evidence(
+            (row["id"], row["normalized_json"]) for row in source_rows
+        ),
+    }
+    return evidence
+
+
 def _collect_p04_generation_table_evidence(
     connection: Any,
 ) -> dict[str, object]:
@@ -2479,6 +2877,9 @@ def collect_database_manifest(target: DatabaseTarget) -> dict[str, object]:
                 field_name: int(reading_body_row[field_name])
                 for field_name in READING_BODY_CONTRACT_EVIDENCE_COUNTS
             }
+            snapshot["unified_saved_state_evidence"] = (
+                _collect_unified_saved_state_evidence(connection)
+            )
         snapshot["legacy_user_state_evidence"] = build_legacy_user_state_evidence(
             legacy_state_rows,
             storage=legacy_state_storage,
@@ -2704,7 +3105,10 @@ def _validate_stage_ambient_database_url(
         "DATABASE_URL"
     )
     try:
-        identity = production_target_identity(ambient_database_url)
+        identity = production_target_identity(
+            ambient_database_url,
+            environ=environ,
+        )
         if identity.url.query:
             raise IsolatedStageTargetError(error_message)
         stage_target_policy.validate(

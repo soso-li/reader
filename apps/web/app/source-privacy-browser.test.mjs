@@ -454,7 +454,7 @@ test("formal source detail dialog has a single form, desktop controls, and compl
     assert.match(dialog.textContent, /永久删除订阅源/);
     assert.match(dialog.textContent, /监控/);
     assert.match(dialog.textContent, /价值/);
-    assert.match(dialog.textContent, /信任分范围 0–100，按（已读 \+ 2×打开原文 \+ 3×星标 \+ 稍后读 \+ 入簇 - 重复）×100 \/ max（抓取数，1）计算。/);
+    assert.match(dialog.textContent, /信任分范围 0–100，按（已读 \+ 2×打开原文 \+ 3×收藏 \+ 入簇 - 重复）×100 \/ max（抓取数，1）计算。/);
     assert.equal(dialog.querySelector("a").getAttribute("rel"), "noopener noreferrer");
     assert.match(dialog.textContent, /重新抓取/);
     assert.match(dialog.textContent, /修改链接/);
@@ -1078,7 +1078,6 @@ function source(overrides = {}) {
     read_count: 0,
     opened_count: 0,
     starred_count: 0,
-    read_later_count: 0,
     cluster_count: 0,
     duplicate_count: 0,
     recent_entry_count_30d: 0,

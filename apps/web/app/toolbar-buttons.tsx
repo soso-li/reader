@@ -19,7 +19,7 @@ export function StateButton({
   disabled?: boolean;
   onClick: () => void;
 }) {
-  const title = icon ? "星标" : label || "操作";
+  const title = icon ? "收藏" : label || "操作";
   const isActive = Boolean(active || (icon && object?.starred));
   return (
     <button className={`icon ${isActive ? "active" : ""}`} type="button" title={title} aria-label={title} disabled={disabled} onClick={onClick}>

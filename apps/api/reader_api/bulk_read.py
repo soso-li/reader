@@ -16,6 +16,8 @@ from .event_interactions import (
     integer_source_ids,
     lock_feed_metrics,
     lock_operation_id,
+    operation_lock_key,
+    original_operation_result,
     require_live_event_sources,
 )
 from .event_projection import event_material_updates_for
@@ -37,6 +39,9 @@ from .schemas import (
     BulkReadManifest,
     BulkReadPrepared,
     BulkReadTarget,
+    EventReadBatchItemOut,
+    EventReadBatchMarkIn,
+    EventUserStateMutationIn,
     EventUserStateMutationOut,
     UserStateOut,
 )
@@ -117,9 +122,15 @@ def confirm_bulk_read_batch(
     session: Session,
     connection: Redis,
     batch_id: str,
+    *,
+    expected_target_kind: str | None = None,
 ) -> int:
     lock_operation_id(session, f"bulk-read-batch:{batch_id}")
     manifest = load_bulk_read_manifest(connection, batch_id)
+    if expected_target_kind is not None and any(
+        target.target_kind != expected_target_kind for target in manifest.targets
+    ):
+        raise HTTPException(status_code=409, detail="批量已读批次目标类型不一致")
     connection.expire(
         bulk_read_batch_key(batch_id),
         BULK_READ_BATCH_TTL_SECONDS,
@@ -242,6 +253,19 @@ def apply_bulk_event_read(
     session: Session,
     targets: list[BulkReadTarget],
 ) -> int:
+    resolved = _resolve_bulk_event_targets(session, targets, collect_errors=None)
+    _apply_resolved_event_reads(session, resolved, dead_source_errors=None)
+    return len(targets)
+
+
+def _resolve_bulk_event_targets(
+    session: Session,
+    targets: list[BulkReadTarget],
+    *,
+    collect_errors: dict[str, str] | None,
+) -> list[tuple[BulkReadTarget, Event, EventRevision]]:
+    if not targets:
+        return []
     event_uids = [target.event_uid for target in targets]
     revision_uids = [target.observed_revision_uid for target in targets]
     events = {
@@ -264,21 +288,38 @@ def apply_bulk_event_read(
     for target in targets:
         assert target.event_uid is not None
         assert target.observed_revision_uid is not None
-        event = events.get(target.event_uid)
-        if event is None:
-            raise HTTPException(status_code=404, detail="Event 不存在")
-        if event.status != "active":
-            raise HTTPException(status_code=409, detail="Event 已被后继事件取代，请刷新")
-        revision = revisions.get(target.observed_revision_uid)
-        if revision is None:
-            raise HTTPException(status_code=404, detail="Event Revision 不存在")
-        if revision.event_id != event.id:
-            raise HTTPException(
-                status_code=409,
-                detail="observed revision 不属于目标 Event",
-            )
+        try:
+            event = events.get(target.event_uid)
+            if event is None:
+                raise HTTPException(status_code=404, detail="Event 不存在")
+            if event.status != "active":
+                raise HTTPException(status_code=409, detail="Event 已被后继事件取代，请刷新")
+            revision = revisions.get(target.observed_revision_uid)
+            if revision is None:
+                raise HTTPException(status_code=404, detail="Event Revision 不存在")
+            if revision.event_id != event.id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="observed revision 不属于目标 Event",
+                )
+        except HTTPException as exc:
+            if collect_errors is None:
+                raise
+            collect_errors[target.operation_id] = str(exc.detail)
+            continue
         resolved.append((target, event, revision))
+    return resolved
 
+
+def _apply_resolved_event_reads(
+    session: Session,
+    resolved: list[tuple[BulkReadTarget, Event, EventRevision]],
+    *,
+    dead_source_errors: dict[str, str] | None,
+) -> dict[str, EventUserStateMutationOut]:
+    if not resolved:
+        return {}
+    revisions = {revision.uid: revision for _, _, revision in resolved}
     event_ids = [event.id for _, event, _ in resolved]
     revision_ids = [revision.id for _, _, revision in resolved]
     observed_sources: dict[int, set[int]] = defaultdict(set)
@@ -365,14 +406,31 @@ def apply_bulk_event_read(
         source_ids.update(read_sources)
         source_ids.update(opened_sources)
     locked_metrics = lock_feed_metrics(session, list(source_ids))
-    require_live_event_sources(
-        locked_metrics,
-        {
+    if dead_source_errors is None:
+        require_live_event_sources(
+            locked_metrics,
+            {
+                source_id
+                for revision_source_ids in observed_sources.values()
+                for source_id in revision_source_ids
+            },
+        )
+    else:
+        dead_sources = {
             source_id
-            for revision_source_ids in observed_sources.values()
-            for source_id in revision_source_ids
-        },
-    )
+            for source_id, (source, _metric) in locked_metrics.items()
+            if source.status == DELETED_SOURCE_STATUS
+        }
+        surviving: list[tuple[BulkReadTarget, Event, EventRevision]] = []
+        for target, event, revision in resolved:
+            if observed_sources[revision.id] & dead_sources:
+                dead_source_errors[target.operation_id] = "Event 来源已失效，请刷新"
+                continue
+            surviving.append((target, event, revision))
+        resolved = surviving
+        if not resolved:
+            return {}
+        event_ids = [event.id for _, event, _ in resolved]
 
     states = {
         state.event_id: state
@@ -458,6 +516,7 @@ def apply_bulk_event_read(
     apply_metric_deltas(session, metric_deltas, locked_metrics)
     session.flush()
     material_updates = event_material_updates_for(session, event_ids)
+    results: dict[str, EventUserStateMutationOut] = {}
     interactions: list[InteractionEvent] = []
     for (
         target,
@@ -476,7 +535,6 @@ def apply_bulk_event_read(
             observed_revision_uid=revision.uid,
             action=EVENT_READ_STATUS_ACTION,
             value="summary_seen",
-            read_later=state.read_later,
             starred=state.starred,
             updated_at=occurred_at,
             read_status=state.read_status,
@@ -487,6 +545,7 @@ def apply_bulk_event_read(
             has_material_update=material_update_uid is not None,
             material_update_revision_uid=material_update_uid,
         )
+        results[target.operation_id] = result
         interactions.append(
             InteractionEvent(
                 operation_id=target.operation_id,
@@ -513,7 +572,92 @@ def apply_bulk_event_read(
         )
     session.add_all(interactions)
     session.flush()
-    return len(targets)
+    return results
+
+
+def apply_event_read_marks(
+    session: Session,
+    marks: list[EventReadBatchMarkIn],
+) -> list[EventReadBatchItemOut]:
+    """Apply client-batched scroll_past summary_seen marks with per-target idempotency.
+
+    与 manifest 批量流程不同：本路径批量上限固定为 EVENT_READ_BATCH_LIMIT，
+    按 operation_lock_key 升序逐 operation 取事务级 advisory 锁，每个目标独立
+    重放或报错，不做整批 all-or-nothing。
+    """
+
+    targets = [
+        BulkReadTarget(
+            target_kind="event",
+            event_uid=mark.event_uid,
+            observed_revision_uid=mark.observed_revision_uid,
+            operation_id=mark.operation_id,
+        )
+        for mark in marks
+    ]
+    for target in sorted(
+        targets, key=lambda entry: operation_lock_key(entry.operation_id)
+    ):
+        lock_operation_id(session, target.operation_id)
+
+    existing = {
+        interaction.operation_id: interaction
+        for interaction in session.scalars(
+            select(InteractionEvent).where(
+                InteractionEvent.operation_id.in_(
+                    [target.operation_id for target in targets]
+                )
+            )
+        ).all()
+    }
+    errors: dict[str, str] = {}
+    replayed: dict[str, EventUserStateMutationOut] = {}
+    fresh: list[BulkReadTarget] = []
+    for target in targets:
+        interaction = existing.get(target.operation_id)
+        if interaction is None:
+            fresh.append(target)
+            continue
+        assert target.event_uid is not None
+        assert target.observed_revision_uid is not None
+        mutation = EventUserStateMutationIn(
+            event_uid=target.event_uid,
+            observed_revision_uid=target.observed_revision_uid,
+            operation_id=target.operation_id,
+            action=EVENT_READ_STATUS_ACTION,
+            value="summary_seen",
+        )
+        try:
+            replayed[target.operation_id] = original_operation_result(
+                session, interaction, mutation
+            )
+        except HTTPException as exc:
+            errors[target.operation_id] = str(exc.detail)
+
+    resolved = _resolve_bulk_event_targets(session, fresh, collect_errors=errors)
+    applied = _apply_resolved_event_reads(
+        session, resolved, dead_source_errors=errors
+    )
+
+    results: list[EventReadBatchItemOut] = []
+    for target in targets:
+        if target.operation_id in errors:
+            results.append(
+                EventReadBatchItemOut(
+                    operation_id=target.operation_id,
+                    error=errors[target.operation_id],
+                )
+            )
+            continue
+        result = replayed.get(target.operation_id) or applied.get(
+            target.operation_id
+        )
+        if result is None:
+            raise RuntimeError("批量标记缺少 operation 结果")
+        results.append(
+            EventReadBatchItemOut(operation_id=target.operation_id, result=result)
+        )
+    return results
 
 
 def apply_bulk_item_read(
@@ -575,7 +719,7 @@ def apply_bulk_item_read(
             )
             session.add(state)
             states[item.id] = state
-        previous = (state.read_status, state.read_later, state.starred)
+        previous = (state.read_status, bool(state.starred or state.read_later))
         state.read_status = next_read_status(state.read_status, "summary_seen")
         state.updated_at = occurred_at
         changed_to_read = (
@@ -598,8 +742,7 @@ def apply_bulk_item_read(
                 payload={
                     "previous": {
                         "read_status": previous[0],
-                        "read_later": previous[1],
-                        "starred": previous[2],
+                        "starred": previous[1],
                     },
                     "metric_source_id": item.source_id,
                     "metric_delta": metric_delta,

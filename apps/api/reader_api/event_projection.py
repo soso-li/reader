@@ -6,8 +6,8 @@ from hashlib import sha256
 import json
 from uuid import uuid4
 
-from sqlalchemy import and_, case, func, select, true
-from sqlalchemy.orm import Session, aliased
+from sqlalchemy import and_, case, func, select, text, true
+from sqlalchemy.orm import Session, aliased, undefer
 
 from .digest import canonical_url
 from .models import (
@@ -52,7 +52,6 @@ class ClusterEventIdentity:
     has_material_update: bool = False
     material_update_revision_uid: str | None = None
     read_status: str = "unread"
-    read_later: bool = False
     starred: bool = False
     uninterested: bool = False
     uninterested_reason: str | None = None
@@ -265,6 +264,7 @@ def _event_evidence_version(
         author_snapshot=raw.author or "",
         published_at_snapshot=item.published_at or raw.published_at,
         content_snapshot=content_snapshot,
+        reading_html_snapshot=document.__dict__.get("reading_html"),
     )
     session.add(version)
     session.flush()
@@ -277,7 +277,7 @@ def _projection_evidence(
     *,
     preferred_version_ids: frozenset[int],
 ) -> list[ProjectionEvidence]:
-    rows = session.execute(
+    query = (
         select(
             ContentItem,
             Document,
@@ -292,7 +292,22 @@ def _projection_evidence(
         .join(Source, Source.id == ContentItem.source_id)
         .where(ClusterItem.cluster_id == cluster_id)
         .order_by(ContentItem.id)
-    ).all()
+    )
+    schema_key = "documents_have_reading_html"
+    if schema_key not in session.info:
+        if session.get_bind().dialect.name == "sqlite":
+            check = "SELECT 1 FROM pragma_table_info('documents') WHERE name = 'reading_html'"
+        else:
+            check = """
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'documents'
+                  AND column_name = 'reading_html'
+            """
+        session.info[schema_key] = session.scalar(text(check)) is not None
+    if session.info[schema_key]:
+        query = query.options(undefer(Document.reading_html))
+    rows = session.execute(query).all()
     if not rows:
         raise RuntimeError(f"Cluster 投影没有可定位证据：cluster_id={cluster_id}")
 
@@ -1294,6 +1309,23 @@ def latest_live_cluster_projection(
 
 
 def cluster_current_event_state_projection(session: Session):
+    statement, _latest_projection = _cluster_current_event_state_select(session)
+    return statement.subquery()
+
+
+def cluster_current_event_state_lateral(session: Session, cluster_id_expr):
+    """逐簇相关 LATERAL 形态的当前事件状态投影。
+
+    分页形状（#108）用它把簇级状态查找钉在驱动表逐行探针上，避免整体
+    物化；仅 PostgreSQL 路径使用，SQLite 继续用 subquery + join。
+    """
+    statement, latest_projection = _cluster_current_event_state_select(session)
+    return statement.where(
+        latest_projection.c.cluster_id == cluster_id_expr
+    ).lateral("cluster_state")
+
+
+def _cluster_current_event_state_select(session: Session):
     material_updates = event_material_update_projection()
     latest_projection = latest_live_cluster_projection(session)
     if session.get_bind().dialect.name == "postgresql":
@@ -1322,7 +1354,6 @@ def cluster_current_event_state_projection(session: Session):
             Event.current_revision_id,
             EventUserState.seen_revision_id,
             EventUserState.read_status,
-            EventUserState.read_later,
             EventUserState.starred,
             EventUserState.uninterested,
             EventUserState.uninterested_reason,
@@ -1335,8 +1366,7 @@ def cluster_current_event_state_projection(session: Session):
         .outerjoin(EventUserState, EventUserState.event_id == Event.id)
         .outerjoin(material_updates, material_updates.c.event_id == Event.id)
         .where(Event.status == "active")
-        .subquery()
-    )
+    ), latest_projection
 
 
 def latest_material_review_projection():
@@ -1433,7 +1463,6 @@ def cluster_event_identities_for(
             EventRevision.uid,
             seen_revision.uid,
             event_state.c.read_status,
-            event_state.c.read_later,
             event_state.c.starred,
             event_state.c.uninterested,
             event_state.c.uninterested_reason,
@@ -1464,7 +1493,6 @@ def cluster_event_identities_for(
         revision_uid,
         seen_revision_uid,
         read_status,
-        read_later,
         starred,
         uninterested,
         uninterested_reason,
@@ -1484,7 +1512,6 @@ def cluster_event_identities_for(
             has_material_update=material_update_revision_uid is not None,
             material_update_revision_uid=material_update_revision_uid,
             read_status=read_status or "unread",
-            read_later=bool(read_later),
             starred=bool(starred),
             uninterested=bool(uninterested),
             uninterested_reason=uninterested_reason,

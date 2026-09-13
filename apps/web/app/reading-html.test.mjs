@@ -439,3 +439,159 @@ function installDom(fetchImpl) {
     }
   };
 }
+
+test("pending translation polls with the same request until ready", async () => {
+  const bodies = [];
+  const readyBlocks = [
+    { id: "block-aaaaaaaaaaaaaaaa", text: "译文 1" },
+    { id: "block-bbbbbbbbbbbbbbbb", text: "译文 2" },
+    { id: "block-cccccccccccccccc", text: "译文 3" },
+    { id: "block-eeeeeeeeeeeeeeee", text: "译文 4" }
+  ];
+  const dom = installDom(async (input, init) => {
+    assert.equal(String(input), "/api/translations");
+    bodies.push(JSON.parse(String(init?.body)));
+    if (bodies.length < 3) {
+      return Response.json({ status: "pending", translation: "", blocks: [], model_version: "m", updated_at: null });
+    }
+    return Response.json({
+      status: "ready",
+      translation: readyBlocks.map((block) => block.text).join("\n"),
+      blocks: readyBlocks,
+      model_version: "m",
+      updated_at: null
+    });
+  });
+  const root = createRoot(dom.container);
+  try {
+    await act(async () => {
+      root.render(
+        React.createElement(TranslatedArticleContent, {
+          apiUrl: "/api",
+          html: richHtml,
+          text: "OpenAI released a new report.",
+          translationNeeded: true,
+          pollIntervalMs: 1
+        })
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    assert.equal(bodies.length, 3, "pending 后以同一请求轮询直至 ready");
+    assert.deepEqual(bodies[0].blocks, bodies[1].blocks);
+    assert.equal(bodies[0].retry, undefined, "自动轮询不携带 retry");
+    assert.match(dom.container.textContent, /译文 1/);
+  } finally {
+    await act(async () => root.unmount());
+    dom.restore();
+  }
+});
+
+test("error status shows retry and the retry request sets the retry flag", async () => {
+  const bodies = [];
+  const dom = installDom(async (_input, init) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    if (bodies.length === 1) {
+      return Response.json({ status: "error", translation: "", blocks: [], model_version: "m", updated_at: null });
+    }
+    return Response.json({ status: "ready", translation: "重试后的译文", blocks: [], model_version: "m", updated_at: null });
+  });
+  const root = createRoot(dom.container);
+  try {
+    await act(async () => {
+      root.render(
+        React.createElement(TranslatedArticleContent, {
+          apiUrl: "/api",
+          text: "OpenAI released a new report.",
+          translationNeeded: true,
+          pollIntervalMs: 1
+        })
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    assert.match(dom.container.textContent, /翻译失败，请重试/);
+    const retryButton = [...dom.container.querySelectorAll("button")].find((el) =>
+      /翻译当前内容/.test(el.textContent || "")
+    );
+    assert.ok(retryButton);
+    await act(async () => retryButton.click());
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+
+    assert.equal(bodies.length, 2);
+    assert.equal(bodies[1].retry, true, "手动重试必须携带 retry 标记");
+    assert.match(dom.container.textContent, /重试后的译文/);
+  } finally {
+    await act(async () => root.unmount());
+    dom.restore();
+  }
+});
+
+test("unmount during pending stops the translation poll", async () => {
+  let requests = 0;
+  const dom = installDom(async () => {
+    requests += 1;
+    return Response.json({ status: "pending", translation: "", blocks: [], model_version: "m", updated_at: null });
+  });
+  const root = createRoot(dom.container);
+  await act(async () => {
+    root.render(
+      React.createElement(TranslatedArticleContent, {
+        apiUrl: "/api",
+        text: "OpenAI released a new report.",
+        translationNeeded: true,
+        pollIntervalMs: 1
+      })
+    );
+  });
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  });
+  await act(async () => root.unmount());
+  const seen = requests;
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(requests, seen, "卸载后不得继续轮询");
+  dom.restore();
+});
+
+for (const leave of ["unmount", "replace"]) {
+  test(`late pending response cannot restart translation after ${leave}`, async () => {
+    const requests = [];
+    let resolveOld;
+    const dom = installDom((_input, init) => {
+      const body = JSON.parse(init.body);
+      requests.push({ body, signal: init.signal });
+      if (body.text === "Old English article") {
+        return new Promise((resolve) => { resolveOld = resolve; });
+      }
+      return Promise.resolve(Response.json({ status: "ready", translation: "新文章译文", model_version: "m", updated_at: null }));
+    });
+    const root = createRoot(dom.container);
+    try {
+      await act(async () => root.render(React.createElement(TranslatedArticleContent, {
+        apiUrl: "/api", text: "Old English article", pollIntervalMs: 1
+      })));
+      await act(async () => {
+        if (leave === "unmount") root.unmount();
+        else root.render(React.createElement(TranslatedArticleContent, {
+          apiUrl: "/api", text: "New English article", pollIntervalMs: 1
+        }));
+      });
+      // Deliberately ignore abort in the mock: a late response must also be fenced out.
+      await act(async () => resolveOld(Response.json({ status: "pending", translation: "", model_version: "m", updated_at: null })));
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); });
+      assert.equal(requests.filter(({ body }) => body.text === "Old English article").length, 1);
+      assert.equal(requests[0].signal.aborted, true);
+      if (leave === "replace") assert.match(dom.container.textContent, /新文章译文/);
+    } finally {
+      if (leave !== "unmount") await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+}

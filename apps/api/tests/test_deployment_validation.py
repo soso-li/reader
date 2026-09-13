@@ -33,9 +33,13 @@ from reader_api.deployment_validation import (
     database_target,
     validate_rehearsal_target,
 )
+from reader_api.production_target import PRODUCTION_HOSTS_ENV
 
 
-PRODUCTION_URL = "postgresql+psycopg://reader:secret@postgres:5432/reader"
+TEST_PRODUCTION_HOST = "192.0.2.10"
+PRODUCTION_URL = (
+    f"postgresql+psycopg://reader:secret@{TEST_PRODUCTION_HOST}:5432/reader"
+)
 REHEARSAL_URL = (
     "postgresql+psycopg://reader:secret@postgres-p01:5432/"
     "reader_p01_rehearsal_issue15"
@@ -106,6 +110,23 @@ def _runtime_user_state_evidence(
     rows: tuple[tuple[object, str], ...] = (),
 ) -> dict[str, dict[str, object]]:
     return {"user_states": build_table_evidence(rows)}
+
+
+def _unified_saved_state_evidence(
+    overrides: dict[str, dict[str, dict[str, object]]] | None = None,
+) -> dict[str, dict[str, dict[str, object]]]:
+    empty = build_table_evidence(())
+    evidence = {
+        table: {"actual": dict(empty), "normalized": dict(empty)}
+        for table in (
+            "event_user_states",
+            "user_states",
+            "feed_metrics",
+            "sources",
+        )
+    }
+    evidence.update(overrides or {})
+    return evidence
 
 
 def _legacy_preserved_evidence(
@@ -198,13 +219,94 @@ def _registered_snapshot(revision: str) -> dict[str, object]:
             "source_selectors_all_null_count": 0,
             "document_body_all_null_count": 0,
         }
+        snapshot["unified_saved_state_evidence"] = (
+            _unified_saved_state_evidence()
+        )
     return snapshot
+
+
+def _unified_saved_transition_snapshots() -> tuple[
+    dict[str, object], dict[str, object]
+]:
+    before = _registered_snapshot("0072_reading_body_contract")
+    after = _registered_snapshot("0073_unified_saved_state")
+    source_policy = build_table_evidence(
+        (
+            (
+                1,
+                '{"external_generation_allowed":false,'
+                '"generation_policy_version":1,'
+                '"privacy_class":"unclassified"}',
+            ),
+        )
+    )
+    for snapshot in (before, after):
+        snapshot["counts"]["sources"] = 1
+        snapshot["counts"]["user_states"] = 1
+        snapshot["reading_body_contract_evidence"][
+            "source_selectors_all_null_count"
+        ] = 1
+        snapshot["p04_upgrade_evidence"]["source_policy_counts"] = {
+            "source_count": 1,
+            "unclassified_count": 1,
+            "public_count": 0,
+            "private_count": 0,
+            "external_allowed_count": 0,
+            "policy_version_one_count": 1,
+        }
+        snapshot["p04_upgrade_evidence"][
+            "source_policy_evidence"
+        ] = source_policy
+    legacy = build_table_evidence(
+        ((1, '{"read_later":true,"starred":false}'),)
+    )
+    unified = build_table_evidence(
+        ((1, '{"read_later":false,"starred":true}'),)
+    )
+    before["unified_saved_state_evidence"] = _unified_saved_state_evidence(
+        {
+            table: {"actual": legacy, "normalized": unified}
+            for table in (
+                "event_user_states",
+                "user_states",
+                "feed_metrics",
+                "sources",
+            )
+        }
+    )
+    after["unified_saved_state_evidence"] = _unified_saved_state_evidence(
+        {
+            table: {"actual": unified, "normalized": unified}
+            for table in (
+                "event_user_states",
+                "user_states",
+                "feed_metrics",
+                "sources",
+            )
+        }
+    )
+    before["runtime_user_state_evidence"] = {"user_states": legacy}
+    after["runtime_user_state_evidence"] = {"user_states": unified}
+    before["p02_projection_evidence"]["event_user_states"] = legacy
+    after["p02_projection_evidence"]["event_user_states"] = unified
+    before["legacy_preserved_table_evidence"]["sources"] = {
+        "columns": list(LEGACY_PRESERVED_TABLE_FIELDS["sources"]),
+        **legacy,
+    }
+    after["legacy_preserved_table_evidence"]["sources"] = {
+        "columns": list(LEGACY_PRESERVED_TABLE_FIELDS["sources"]),
+        **unified,
+    }
+    before["preserved_table_evidence"]["sources"] = legacy
+    after["preserved_table_evidence"]["sources"] = unified
+    return before, after
 
 
 def test_production_database_and_host_require_explicit_maintenance_authorization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv(PRODUCTION_AUTH_ENV, raising=False)
+    monkeypatch.setenv(PRODUCTION_HOSTS_ENV, TEST_PRODUCTION_HOST)
 
     with pytest.raises(DatabaseSafetyError, match="生产维护授权"):
         database_target(PRODUCTION_URL)
@@ -282,6 +384,8 @@ def test_production_authorization_never_makes_a_production_database_a_restore_ta
 @pytest.mark.parametrize(
     ("host", "canonical_host"),
     (
+        (TEST_PRODUCTION_HOST, TEST_PRODUCTION_HOST),
+        (f"{TEST_PRODUCTION_HOST}.", TEST_PRODUCTION_HOST),
         ("postgres", "postgres"),
         ("reader-postgres", "reader-postgres"),
         ("postgres.", "postgres"),
@@ -289,6 +393,7 @@ def test_production_authorization_never_makes_a_production_database_a_restore_ta
         ("postgres。", "postgres"),
         ("postgres．", "postgres"),
         ("postgres｡", "postgres"),
+        (f"[::ffff:{TEST_PRODUCTION_HOST}]", TEST_PRODUCTION_HOST),
     ),
 )
 def test_production_authorization_never_turns_a_production_host_into_rehearsal(
@@ -300,7 +405,10 @@ def test_production_authorization_never_turns_a_production_host_into_rehearsal(
         "reader_p01_rehearsal_issue15",
         production_maintenance=True,
         maintenance_id="issue-15-20260712",
-        environ={PRODUCTION_AUTH_ENV: "1"},
+        environ={
+            PRODUCTION_AUTH_ENV: "1",
+            PRODUCTION_HOSTS_ENV: TEST_PRODUCTION_HOST,
+        },
     )
     assert target.host == canonical_host
 
@@ -315,7 +423,7 @@ def test_production_authorization_never_turns_a_production_host_into_rehearsal(
         "0xc0000206",
         "192.000.002.006",
         "0300.000.002.006",
-        "192.2.6",
+        "192.0.518",
     ),
 )
 def test_deployment_evidence_rejects_ambiguous_numeric_host(host: str) -> None:
@@ -812,6 +920,83 @@ def test_reading_body_upgrade_rejects_rewritten_legacy_document() -> None:
     assert any(
         mismatch["field"]
         == "reading_body_contract_evidence.document_body_all_null_count"
+        for mismatch in result["mismatches"]
+    )
+
+
+def test_unified_saved_upgrade_accepts_only_the_normalized_transform() -> None:
+    before, after = _unified_saved_transition_snapshots()
+
+    assert compare_database_manifests(_manifest(before), _manifest(after)) == {
+        "ok": True,
+        "mismatches": [],
+    }
+
+
+def test_unified_saved_upgrade_rejects_changed_normalized_state() -> None:
+    before, after = _unified_saved_transition_snapshots()
+    changed = build_table_evidence(
+        ((1, '{"read_later":false,"starred":false}'),)
+    )
+    after["unified_saved_state_evidence"]["feed_metrics"] = {
+        "actual": changed,
+        "normalized": changed,
+    }
+
+    result = compare_database_manifests(_manifest(before), _manifest(after))
+
+    assert result["ok"] is False
+    assert result["mismatches"] == [
+        {
+            "field": (
+                "unified_saved_state_evidence.feed_metrics.normalized."
+                "ordered_rows_sha256"
+            ),
+            "before": before["unified_saved_state_evidence"]["feed_metrics"][
+                "normalized"
+            ]["ordered_rows_sha256"],
+            "after": changed["ordered_rows_sha256"],
+        }
+    ]
+
+
+def test_unified_saved_upgrade_requires_post_migration_normal_form() -> None:
+    before, after = _unified_saved_transition_snapshots()
+    legacy = before["unified_saved_state_evidence"]["sources"]["actual"]
+    after["unified_saved_state_evidence"]["sources"]["actual"] = legacy
+
+    result = compare_database_manifests(_manifest(before), _manifest(after))
+
+    assert result["ok"] is False
+    assert result["mismatches"] == [
+        {
+            "field": (
+                "unified_saved_state_evidence.sources.actual."
+                "ordered_rows_sha256"
+            ),
+            "before": after["unified_saved_state_evidence"]["sources"][
+                "normalized"
+            ]["ordered_rows_sha256"],
+            "after": legacy["ordered_rows_sha256"],
+        }
+    ]
+
+
+@pytest.mark.parametrize("table", ("migration_baselines", "interaction_events"))
+def test_unified_saved_upgrade_keeps_other_projection_evidence_strict(
+    table: str,
+) -> None:
+    before, after = _unified_saved_transition_snapshots()
+    changed = dict(after["p02_projection_evidence"][table])
+    changed["ordered_rows_sha256"] = "a" * 64
+    after["p02_projection_evidence"][table] = changed
+
+    result = compare_database_manifests(_manifest(before), _manifest(after))
+
+    assert result["ok"] is False
+    assert any(
+        mismatch["field"]
+        == f"p02_projection_evidence.{table}.ordered_rows_sha256"
         for mismatch in result["mismatches"]
     )
 

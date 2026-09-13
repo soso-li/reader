@@ -12,6 +12,7 @@ from .event_projection import (
     cluster_current_event_state_projection,
     cluster_event_identities_for,
 )
+from .event_stream import cluster_effective_state_expressions
 from .event_synthesis import GenerationResultNotCurrentError
 from .generation_lifecycle import latest_attempt, stable_hash
 from .uninterested import ordinary_content_clause
@@ -146,7 +147,11 @@ def report_application_context(
 def report_clusters(
     session: Session, start: datetime, end: datetime
 ) -> list[Cluster]:
-    current_event_state = cluster_current_event_state_projection(session)
+    (
+        current_event_state,
+        effective_read_status,
+        _effective_starred,
+    ) = cluster_effective_state_expressions(session)
     window_material = (
         select(
             EvidenceReview.event_id.label("event_id"),
@@ -172,13 +177,6 @@ def report_clusters(
         ),
         else_=Cluster.first_seen_at,
     ).label("report_at")
-    effective_read_status = case(
-        (
-            current_event_state.c.material_update_revision_uid.is_not(None),
-            "unread",
-        ),
-        else_=func.coalesce(current_event_state.c.read_status, "unread"),
-    )
     return list(
         session.scalars(
             select(Cluster, report_at)

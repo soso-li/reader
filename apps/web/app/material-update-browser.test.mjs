@@ -45,6 +45,9 @@ test("list previews never render as detail while stale full-body requests are ca
   const aborted = [];
   const mounted = await mountReader([preview(first), preview(second)], null, {
     fetchImpl: async (input, init) => {
+      if (String(input).endsWith("/translations")) {
+        return jsonResponse({ status: "skipped", translation: "", model_version: "", updated_at: null });
+      }
       const id = Number(String(input).match(/clusters\/(\d+)/)?.[1]);
       const response = responses.get(id);
       init.signal.addEventListener("abort", () => {
@@ -195,7 +198,7 @@ test("history navigation can restore a source pane while changing filters", asyn
   }
 });
 
-test("cluster detail exposes read later to pointer users", async () => {
+test("cluster detail exposes one unified saved action to pointer users", async () => {
   const cluster = clusterFixture({ id: 11 });
   const requests = [];
   const mounted = await mountReader([cluster], cluster, {
@@ -204,21 +207,25 @@ test("cluster detail exposes read later to pointer users", async () => {
       requests.push(request);
       return jsonResponse({
         ...request,
-        action: "read_later_set",
-        read_later: true,
-        starred: false,
+        action: "starred_set",
+        starred: true,
         updated_at: "2026-07-16T03:00:00Z"
       });
     }
   });
 
   try {
-    const button = mounted.container.querySelector("button[aria-label='稍后阅读']");
+    const button = mounted.container.querySelector("button[aria-label='收藏']");
     assert.ok(button);
-    assert.match(button.closest(".toolbar-more-row")?.textContent ?? "", /稍后读/);
+    assert.equal(button.getAttribute("title"), "收藏");
+    assert.equal(
+      mounted.container.querySelector("[aria-label='稍后阅读'], [aria-label='星标']"),
+      null
+    );
+    assert.doesNotMatch(mounted.container.textContent ?? "", /稍后读|稍后阅读|星标/);
     await click(button);
     assert.equal(requests.length, 1);
-    assert.equal(requests[0].action, "read_later_set");
+    assert.equal(requests[0].action, "starred_set");
     assert.equal(requests[0].value, true);
   } finally {
     await mounted.unmount();
@@ -315,6 +322,62 @@ test("unread cluster pagination continues after the last loaded event", async ()
       ),
       ["22", "11", "10", "9"]
     );
+  } finally {
+    await mounted.unmount();
+  }
+});
+
+test("cluster pagination failure keeps rows, auto-retries once, and recovers via 重试", async () => {
+  const requests = [];
+  const nextRows = [
+    clusterFixture({ id: 10, title: "第三条事件" }),
+    clusterFixture({ id: 9, title: "第四条事件" })
+  ];
+  const mounted = await mountReader(
+    [clusterFixture({ id: 22 }), clusterFixture({ id: 11 })],
+    null,
+    {
+      immediateDwell: true,
+      intersectImmediately: true,
+      pageSize: 2,
+      fetchImpl: async (input) => {
+        const url = new URL(String(input));
+        requests.push(url);
+        if (requests.length <= 2) return jsonResponse({ detail: "boom" }, 502);
+        return jsonResponse(requests.length === 3 ? nextRows : []);
+      }
+    }
+  );
+
+  try {
+    await flushReact();
+    await flushReact();
+    await flushReact();
+
+    assert.equal(requests.length, 2, "exactly one automatic retry after the first failure");
+    const footer = mounted.container.querySelector(".list-footer");
+    assert.match(footer?.textContent ?? "", /更多聚类加载失败/);
+    assert.deepEqual(
+      [...mounted.container.querySelectorAll(".cluster-list-entry")].map(
+        (entry) => entry.getAttribute("data-scroll-seen-id")
+      ),
+      ["22", "11"],
+      "loaded rows survive pagination failures"
+    );
+
+    const retry = mounted.container.querySelector(".list-footer-retry");
+    assert.ok(retry, "failure footer offers 重试");
+    await click(retry);
+    await flushReact();
+    await flushReact();
+
+    assert.deepEqual(
+      [...mounted.container.querySelectorAll(".cluster-list-entry")].map(
+        (entry) => entry.getAttribute("data-scroll-seen-id")
+      ),
+      ["22", "11", "10", "9"]
+    );
+    assert.doesNotMatch(footer?.textContent ?? "", /加载失败/);
   } finally {
     await mounted.unmount();
   }
@@ -544,7 +607,6 @@ function clusterFixture({
     url: `https://source${position}.example/${id}`,
     published_at: `2026-07-16T0${position}:00:00Z`,
     read_status: "unread",
-    read_later: false,
     starred: false
   }));
   const citation = {
@@ -605,7 +667,6 @@ function clusterFixture({
     last_seen_at: "2026-07-16T02:00:00Z",
     item_count: items.length,
     read_status: "summary_seen",
-    read_later: false,
     starred: false,
     items,
     source_view_evidence: items.map((item, index) => ({
@@ -746,8 +807,9 @@ function installDom({
   );
   const nativeSetTimeout = dom.window.setTimeout.bind(dom.window);
   if (immediateDwell) {
+    const collapsedDelays = new Set([1000, 1500, 1800]);
     dom.window.setTimeout = (callback, delay, ...args) =>
-      nativeSetTimeout(callback, delay === 1800 ? 0 : delay, ...args);
+      nativeSetTimeout(callback, collapsedDelays.has(delay) ? 0 : delay, ...args);
   }
   dom.window.requestAnimationFrame = (callback) => nativeSetTimeout(callback, 0);
   dom.window.cancelAnimationFrame = (timer) => dom.window.clearTimeout(timer);
@@ -831,7 +893,6 @@ function readResult(request, readStatus, hasMaterialUpdate, materialRevisionUid)
     current_revision_differs_from_seen: request.observed_revision_uid !== R2,
     has_material_update: hasMaterialUpdate,
     material_update_revision_uid: materialRevisionUid,
-    read_later: false,
     starred: false,
     updated_at: "2026-07-16T03:00:00Z"
   };

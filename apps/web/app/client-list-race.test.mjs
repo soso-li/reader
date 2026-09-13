@@ -35,6 +35,12 @@ test("client list owners invalidate stale pagination and detail requests", async
   assert.match(clusterList, /pageAbortController\.current\?\.abort\(\)/);
   assert.match(clusterList, /pageRequestId\.current/);
   assert.doesNotMatch(clusterList, /useEffect\(\(\) => \{\s*onRowsChange\?\.\(rows\)/);
+  assert.match(clusterList, /signal: withPageTimeout\(controller\.signal\)/);
+  assert.match(clusterList, /if \(requestId !== pageRequestId\.current\) return;\s*setLoadError\("更多聚类加载失败"\)/);
+  assert.match(clusterList, /list-footer-retry/);
+  assert.match(browse, /signal: withPageTimeout\(controller\.signal\)/);
+  assert.match(browse, /if \(requestId !== pageRequestId\.current\) return;\s*setLoadError\("更多条目加载失败"\)/);
+  assert.match(browse, /onRetryLoadMore=\{retryLoadMore\}/);
   assert.doesNotMatch(browse, /\.filter\(\(item\) => matchesListFilter/);
   assert.match(browse, /\|\| serverDetailError/);
   assert.match(browse, /阅读状态保存失败，请重试。/);
@@ -43,6 +49,17 @@ test("client list owners invalidate stale pagination and detail requests", async
   assert.doesNotMatch(clusterView, /dispatchEvent\(new window\.PopStateEvent\("popstate"\)\)/);
   assert.match(clusterView, /requestId === listRequestId\.current[\s\S]{0,160}setClientListError\("列表加载失败，请重试。"\)/);
   assert.match(clusterView, /事件状态保存失败，请重试。/);
+  assert.match(
+    clusterView,
+    /trigger === "scroll_past" \? "batch" : "single"/,
+    "只有滚动打点走批量通道"
+  );
+  assert.match(
+    clusterView,
+    /transport === "batch"[\s\S]{0,220}scrollMarkCollectorRef\.current\?\.enqueue/
+  );
+  assert.match(clusterView, /addEventListener\("pagehide", onPagehide\)/);
+  assert.match(clusterView, /UNREAD_COUNT_REFRESH_DEBOUNCE_MS\);/);
   assert.match(clusterView, /document\.querySelector\('dialog\[open\], \[role="dialog"\]\[aria-modal="true"\]'\)/);
   assert.match(clusterView, /event\.composedPath\(\)\.some\(\(target\) => target instanceof HTMLDialogElement\)/);
   assert.match(clusterView, /selectedId && \(serverDetailError \|\| clientDetailError\)/);

@@ -1413,11 +1413,30 @@ body.reader-context-resizing {
 
 .list-footer {
   min-height: 44px;
+  /* 列表窗格是纵向 flex：不允许收缩，否则重试按钮会溢出到底部栏之下 */
+  flex-shrink: 0;
   padding: 12px 10px calc(12px + var(--bottom-state-filter-height));
   color: var(--muted);
   font-size: 12px;
   text-align: center;
   border-bottom: 1px solid var(--border);
+}
+
+.list-footer-retry {
+  min-height: 44px;
+  min-width: 88px;
+  padding: 8px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.list-footer-retry:hover,
+.list-footer-retry:focus-visible {
+  border-color: var(--text);
 }
 
 .browse-image-grid {

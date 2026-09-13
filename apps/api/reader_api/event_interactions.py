@@ -27,7 +27,6 @@ from .schemas import EventUserStateMutationIn, EventUserStateMutationOut
 
 EVENT_STATE_ACTION_FIELDS = {
     "starred_set": "starred",
-    "read_later_set": "read_later",
 }
 EVENT_READ_STATUS_ACTION = "read_status_set"
 EVENT_READ_STATUSES = {"unread", "summary_seen", "original_opened"}
@@ -37,6 +36,8 @@ SEEN_READ_STATUSES = {"summary_seen", "original_opened"}
 def apply_event_user_state_mutation(
     session: Session,
     mutation: EventUserStateMutationIn,
+    *,
+    capture_state_snapshot: bool = False,
 ) -> EventUserStateMutationOut:
     field = EVENT_STATE_ACTION_FIELDS.get(mutation.action)
     is_read_status = mutation.action == EVENT_READ_STATUS_ACTION
@@ -119,7 +120,7 @@ def apply_event_user_state_mutation(
     read_sources: list[int] = []
     opened_sources: list[int] = []
     if field is not None:
-        previous_sources = previous_metric_sources(session, event.id, mutation.action)
+        previous_sources = previous_saved_metric_sources(session, event.id)
         metric_source_ids = sorted(set(observed_sources).union(previous_sources))
     else:
         (
@@ -159,26 +160,25 @@ def apply_event_user_state_mutation(
     occurred_at = now_utc()
     interaction_payload: dict[str, object]
     if field is not None:
-        previous_value = bool(getattr(state, field))
+        previous_value = bool(state.starred or state.read_later)
         next_sources, metric_delta = metric_projection_change(
             previous_value=previous_value,
             next_value=bool(mutation.value),
             previous_sources=previous_sources,
             observed_sources=observed_sources,
         )
-        setattr(state, field, mutation.value)
-        metric_field = (
-            "starred_count" if field == "starred" else "read_later_count"
-        )
+        state.starred = bool(mutation.value)
+        state.read_later = False
         apply_metric_deltas(
             session,
             {
-                source_id: {metric_field: delta}
+                source_id: {"starred_count": delta}
                 for source_id, delta in metric_delta.items()
             },
             locked_metrics,
         )
         interaction_payload = {
+            "saved_semantics": "unified",
             "metric_source_ids": next_sources,
             "metric_delta": {
                 str(key): value for key, value in metric_delta.items()
@@ -209,7 +209,6 @@ def apply_event_user_state_mutation(
         "observed_revision_uid": revision.uid,
         "action": mutation.action,
         "value": mutation.value,
-        "read_later": state.read_later,
         "starred": state.starred,
         "updated_at": occurred_at,
     }
@@ -239,6 +238,22 @@ def apply_event_user_state_mutation(
     result = EventUserStateMutationOut(**result_data)
     result_payload = result.model_dump(mode="json", exclude_unset=True)
     interaction_payload["result"] = result_payload
+    if capture_state_snapshot:
+        session.flush()
+        seen_revision = (
+            session.get(EventRevision, state.seen_revision_id)
+            if state.seen_revision_id is not None
+            else None
+        )
+        interaction_payload["state_snapshot"] = {
+            "read_status": state.read_status,
+            "starred": bool(state.starred),
+            "seen_revision_uid": seen_revision.uid if seen_revision else None,
+            "has_material_update": (
+                event_material_updates_for(session, [event.id]).get(event.id)
+                is not None
+            ),
+        }
     interaction = InteractionEvent(
         operation_id=mutation.operation_id,
         target_kind="event",
@@ -355,17 +370,20 @@ def apply_metric_deltas(
         refresh_source_trust_score(session, source, metric)
 
 
-def lock_operation_id(session: Session, operation_id: str) -> None:
-    if session.bind is None or session.bind.dialect.name != "postgresql":
-        return
-    lock_key = int.from_bytes(
+def operation_lock_key(operation_id: str) -> int:
+    return int.from_bytes(
         hashlib.sha256(operation_id.encode("utf-8")).digest()[:8],
         byteorder="big",
         signed=True,
     )
+
+
+def lock_operation_id(session: Session, operation_id: str) -> None:
+    if session.bind is None or session.bind.dialect.name != "postgresql":
+        return
     session.execute(
         text("SELECT pg_advisory_xact_lock(:lock_key)"),
-        {"lock_key": lock_key},
+        {"lock_key": operation_lock_key(operation_id)},
     )
 
 
@@ -386,13 +404,16 @@ def original_operation_result(
     stored_evidence_version_uid = (
         result.get("evidence_version_uid") if isinstance(result, dict) else None
     )
+    action_matches = existing.action == mutation.action or (
+        existing.action == "read_later_set" and mutation.action == "starred_set"
+    )
     matches = (
         existing.target_kind == "event"
         and event is not None
         and revision is not None
         and event.uid == mutation.event_uid
         and revision.uid == mutation.observed_revision_uid
-        and existing.action == mutation.action
+        and action_matches
         and existing.set_value == mutation.value
         and stored_source_id == mutation.source_id
         and stored_evidence_version_uid == mutation.evidence_version_uid
@@ -404,6 +425,14 @@ def original_operation_result(
         )
     if not isinstance(result, dict):
         raise RuntimeError("Interaction Event 缺少原操作结果")
+    if "read_later" in result:
+        result = {
+            **result,
+            "starred": bool(result.get("starred") or result.get("read_later")),
+        }
+        result.pop("read_later", None)
+    if existing.action == "read_later_set":
+        result = {**result, "action": "starred_set"}
     return EventUserStateMutationOut.model_validate(result)
 
 
@@ -423,29 +452,45 @@ def revision_source_ids(session: Session, revision_id: int) -> list[int]:
     )
 
 
-def previous_metric_sources(
+def previous_saved_metric_sources(
     session: Session,
     event_id: int,
-    action: str,
 ) -> list[int]:
-    previous = session.scalar(
-        select(InteractionEvent)
+    starred_sources: list[int] = []
+    read_later_sources: list[int] = []
+    baseline = session.scalar(
+        select(MigrationBaseline)
         .where(
-            InteractionEvent.event_id == event_id,
-            InteractionEvent.action == action,
-        )
-        .order_by(
-            InteractionEvent.recorded_at.desc(),
-            InteractionEvent.id.desc(),
+            MigrationBaseline.resolved_event_id == event_id,
         )
         .limit(1)
     )
-    if previous is None or not isinstance(previous.payload, dict):
-        return []
-    source_ids = previous.payload.get("metric_source_ids")
-    if not isinstance(source_ids, list):
-        return []
-    return sorted({source_id for source_id in source_ids if isinstance(source_id, int)})
+    if baseline is not None and baseline.resolved_revision_id is not None:
+        baseline_sources = revision_source_ids(session, baseline.resolved_revision_id)
+        if baseline.starred:
+            starred_sources = baseline_sources
+        if baseline.read_later:
+            read_later_sources = baseline_sources
+
+    interactions = session.scalars(
+        select(InteractionEvent)
+        .where(
+            InteractionEvent.event_id == event_id,
+            InteractionEvent.action.in_(("starred_set", "read_later_set")),
+        )
+        .order_by(InteractionEvent.recorded_at, InteractionEvent.id)
+    )
+    for interaction in interactions:
+        payload = interaction.payload if isinstance(interaction.payload, dict) else {}
+        sources = integer_source_ids(payload.get("metric_source_ids"))
+        if payload.get("saved_semantics") == "unified":
+            starred_sources = sources
+            read_later_sources = []
+        elif interaction.action == "starred_set":
+            starred_sources = sources
+        else:
+            read_later_sources = sources
+    return sorted(set(starred_sources).union(read_later_sources))
 
 
 def previous_read_metric_sources(

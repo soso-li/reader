@@ -69,6 +69,9 @@ def import_outline(
                     media_type=media_type,
                 )
             )
+            # Production sessions disable autoflush. Make this identity visible to
+            # adjacent duplicate outlines while keeping the whole import atomic.
+            session.flush()
             return 1
         session.refresh(exists, with_for_update=True)
         exists.url = xml_url

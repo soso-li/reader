@@ -46,7 +46,6 @@ type TopicGroup = {
   description: string;
   cluster_count: number;
   read_status: string;
-  read_later: boolean;
   starred: boolean;
 };
 type ReadingNavigate = (event: MouseEvent<HTMLAnchorElement>, href: string) => void;
@@ -365,7 +364,6 @@ function TopicContext({ topics, selectedTopic }: { topics: TopicGroup[]; selecte
             id={topic.id}
             meta={`${topic.query} · ${topic.cluster_count} 个事件聚类`}
             objectType="topic"
-            readLater={topic.read_later}
             readStatus={topic.read_status}
             starred={topic.starred}
             summary={topic.description || `追踪包含 ${topic.query} 的长期议题。`}
